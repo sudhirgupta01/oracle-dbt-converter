@@ -86,12 +86,22 @@ export default function App() {
     setIsSelfHealedCode(false);
   };
 
-  // If user edits code manually, reset the DAG lock
   const handleSourceChange = (e) => {
     setSourceCode(e.target.value);
     setDagStatus('pending');
     setDagData(null);
     resetGeneratedStates();
+  };
+
+  // BRUTE-FORCE JSON EXTRACTOR: Ignores all AI conversational filler and markdown
+  const safeJsonParse = (rawStr) => {
+    const start = rawStr.indexOf('{');
+    const end = rawStr.lastIndexOf('}');
+    if (start === -1 || end === -1) {
+      throw new Error('No JSON structure detected in the engine response.');
+    }
+    const cleanStr = rawStr.substring(start, end + 1);
+    return JSON.parse(cleanStr);
   };
 
   const callNeuralEngine = async (promptText) => {
@@ -101,7 +111,7 @@ export default function App() {
       const timeoutId = setTimeout(() => controller.abort(), 20000);
       try {
         const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
+          `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){modelName}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -112,9 +122,7 @@ export default function App() {
         clearTimeout(timeoutId);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
-        let rawCode = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        // Clean markdown blocks safely
-        return rawCode.replace(/^```[a-zA-Z]*\n?/gm, '').replace(/```$/gm, '').trim();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       } catch (err) {
         clearTimeout(timeoutId);
         lastError = err;
@@ -144,19 +152,15 @@ Respond ONLY with a valid JSON object matching this exact structure:
 }
 
 CRITICAL JSON PARSING RULES:
-1. Do NOT use markdown backticks around the JSON.
-2. Output the JSON completely flattened on a SINGLE LINE.
-3. NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your ASCII art or code rewrite. The system will replace ||| later.
-4. Escape any double quotes inside strings as \\".
+NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your ASCII art or code rewrite.
 
 Oracle Source:
 ${sourceCode}`;
 
     try {
-      const jsonResponse = await callNeuralEngine(prompt);
-      const parsed = JSON.parse(jsonResponse);
+      const rawResponse = await callNeuralEngine(prompt);
+      const parsed = safeJsonParse(rawResponse);
       
-      // Safely swap the ||| placeholders back to real line breaks for rendering
       if (parsed.asciiDag) parsed.asciiDag = parsed.asciiDag.replace(/\|\|\|/g, '\n');
       if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = parsed.suggestedCodeFix.replace(/\|\|\|/g, '\n');
       
@@ -198,17 +202,15 @@ ${sourceCode}`;
 Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
 
 CRITICAL JSON PARSING RULES:
-1. Do NOT use markdown backticks around the JSON.
-2. Output the JSON completely flattened on a SINGLE LINE.
-3. NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your SQL or YAML code.
-4. Escape any double quotes inside strings as \\".
+NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your SQL or YAML code.
+Escape any double quotes inside strings as \\".
 
 Oracle Source:
 ${sourceCode}`;
 
     try {
-      const jsonResponse = await callNeuralEngine(prompt);
-      const parsed = JSON.parse(jsonResponse);
+      const rawResponse = await callNeuralEngine(prompt);
+      const parsed = safeJsonParse(rawResponse);
       
       const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
       const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
@@ -237,8 +239,10 @@ PL/SQL: ${srcCode}
 dbt SQL: ${targetSql}`;
 
     try {
-      const treeOutput = await callNeuralEngine(scaffoldPrompt);
-      setScaffoldTree(treeOutput);
+      let rawTree = await callNeuralEngine(scaffoldPrompt);
+      // Clean possible backticks from non-JSON AI response
+      rawTree = rawTree.replace(/^```[a-zA-Z]*\n?/gm, '').replace(/```$/gm, '').trim();
+      setScaffoldTree(rawTree);
     } catch {
       setScaffoldTree(null);
     } finally {
@@ -272,9 +276,8 @@ Respond ONLY with a valid JSON object:
 }
 
 CRITICAL JSON PARSING RULES:
-1. Output completely flattened on a SINGLE LINE with no markdown backticks.
-2. NEVER use actual line breaks or \\n. Use the literal text ||| for line breaks if needed.
-3. Escape double quotes as \\".
+NEVER use actual line breaks or \\n in strings. Use the literal text ||| for line breaks if needed.
+Escape double quotes as \\".
 
 Oracle Source:
 ${sourceCode}
@@ -282,10 +285,9 @@ dbt SQL:
 ${dbtSql}`;
 
     try {
-      const jsonResponse = await callNeuralEngine(diagnosticPrompt);
-      const parsedJson = JSON.parse(jsonResponse);
+      const rawResponse = await callNeuralEngine(diagnosticPrompt);
+      const parsedJson = safeJsonParse(rawResponse);
       
-      // Clean placeholders if used
       Object.keys(parsedJson).forEach(key => {
         if (typeof parsedJson[key] === 'string') {
           parsedJson[key] = parsedJson[key].replace(/\|\|\|/g, '\n');
@@ -314,9 +316,8 @@ ${dbtSql}`;
 Respond ONLY with a valid JSON object containing keys: "sql" and "yaml".
 
 CRITICAL JSON PARSING RULES:
-1. Output completely flattened on a SINGLE LINE with no markdown backticks.
-2. NEVER use actual line breaks or \\n. Use the literal text ||| for line breaks.
-3. Escape double quotes as \\".
+NEVER use actual line breaks or \\n. Use the literal text ||| for line breaks.
+Escape double quotes as \\".
 
 Current SQL:
 ${dbtSql}
@@ -324,8 +325,8 @@ Current YAML:
 ${dbtYaml}`;
 
     try {
-      const jsonResponse = await callNeuralEngine(remediationPrompt);
-      const parsed = JSON.parse(jsonResponse);
+      const rawResponse = await callNeuralEngine(remediationPrompt);
+      const parsed = safeJsonParse(rawResponse);
       
       const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
       const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
@@ -349,7 +350,7 @@ ${dbtYaml}`;
 
   // 6. GitHub Deploy
   const pushFileToGitHub = async (fileName, fileContent) => {
-    const url = `https://api.github.com/repos/${gitOwner}/${gitRepo}/contents/models/${fileName}`;
+    const url = `[https://api.github.com/repos/$](https://api.github.com/repos/$){gitOwner}/${gitRepo}/contents/models/${fileName}`;
     const contentBase64 = btoa(unescape(encodeURIComponent(fileContent)));
     let sha = null;
     
