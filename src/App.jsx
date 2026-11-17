@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 
 const ENGINE_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-2.5-pro'
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite'
 ];
 
 const DB_TARGETS = [
@@ -93,6 +93,9 @@ export default function App() {
     resetGeneratedStates();
   };
 
+  const formatMultiline = (val) =>
+    typeof val === 'string' ? val.replace(/\|\|\|/g, '\n').replace(/\\n/g, '\n') : val;
+
   const safeJsonParse = (rawStr) => {
     const start = rawStr.indexOf('{');
     const end = rawStr.lastIndexOf('}');
@@ -143,42 +146,54 @@ export default function App() {
     const cleanKey = apiKey.trim();
     let lastError = null;
 
-    // 1. Try primary known production endpoints
+    // 1. Try primary current endpoints
     for (const modelName of ENGINE_MODELS) {
       try {
         const text = await executeModelRequest(modelName, promptText, expectJson, cleanKey);
         if (text) return text;
       } catch (err) {
         lastError = err;
-        // Stop immediately on invalid API key (400/403)
-        if (err.status === 400 || err.status === 403) {
+        if (err.status === 403 || (err.status === 400 && /api[_ ]key/i.test(err.message))) {
           throw new Error(`Authentication failed (${err.message}). Verify your Engine API Key.`);
+        }
+        // If 400 was due to responseMimeType on a specific model, retry plain text immediately
+        if (err.status === 400 && expectJson) {
+          try {
+            const fallbackText = await executeModelRequest(modelName, promptText, false, cleanKey);
+            if (fallbackText) return fallbackText;
+          } catch (retryErr) {
+            lastError = retryErr;
+          }
         }
       }
     }
 
-    // 2. Auto-discover an active model on the user's API key if primary endpoints returned 404
+    // 2. Auto-discover active non-deprecated models if primary endpoints fail
     try {
       const listRes = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(cleanKey)}`
       );
       if (listRes.ok) {
         const listData = await listRes.json();
-        const available = (listData.models || []).find(
-          (m) =>
-            Array.isArray(m.supportedGenerationMethods) &&
-            m.supportedGenerationMethods.includes('generateContent') &&
-            m.name.includes('flash')
-        ) || (listData.models || []).find(
-          (m) =>
-            Array.isArray(m.supportedGenerationMethods) &&
-            m.supportedGenerationMethods.includes('generateContent')
-        );
+        const candidates = (listData.models || [])
+          .filter(
+            (m) =>
+              Array.isArray(m.supportedGenerationMethods) &&
+              m.supportedGenerationMethods.includes('generateContent') &&
+              !m.name.includes('2.0') &&
+              !m.name.includes('2.5') &&
+              !ENGINE_MODELS.includes(m.name.replace(/^models\//, ''))
+          )
+          .sort((a, b) => b.name.localeCompare(a.name));
 
-        if (available && available.name) {
-          const discoveredId = available.name.replace(/^models\//, '');
-          const text = await executeModelRequest(discoveredId, promptText, expectJson, cleanKey);
-          if (text) return text;
+        for (const candidate of candidates) {
+          try {
+            const discoveredId = candidate.name.replace(/^models\//, '');
+            const text = await executeModelRequest(discoveredId, promptText, expectJson, cleanKey);
+            if (text) return text;
+          } catch (innerErr) {
+            lastError = innerErr;
+          }
         }
       }
     } catch (discoveryErr) {
@@ -215,8 +230,8 @@ ${sourceCode}`;
       const rawResponse = await callNeuralEngine(prompt, true);
       const parsed = safeJsonParse(rawResponse);
 
-      if (parsed.asciiDag) parsed.asciiDag = parsed.asciiDag.replace(/\|\|\|/g, '\n');
-      if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = parsed.suggestedCodeFix.replace(/\|\|\|/g, '\n');
+      if (parsed.asciiDag) parsed.asciiDag = formatMultiline(parsed.asciiDag);
+      if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = formatMultiline(parsed.suggestedCodeFix);
 
       setDagData(parsed);
       setDagStatus(parsed.hasLoop ? 'error' : 'clean');
@@ -268,8 +283,8 @@ ${sourceCode}`;
       const rawResponse = await callNeuralEngine(prompt, true);
       const parsed = safeJsonParse(rawResponse);
 
-      const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
-      const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
+      const cleanSql = formatMultiline(parsed.sql || '');
+      const cleanYaml = formatMultiline(parsed.yaml || '');
 
       setDbtSql(cleanSql);
       setDbtYaml(cleanYaml);
@@ -341,7 +356,7 @@ ${dbtSql}`;
 
       Object.keys(parsedJson).forEach(key => {
         if (typeof parsedJson[key] === 'string') {
-          parsedJson[key] = parsedJson[key].replace(/\|\|\|/g, '\n');
+          parsedJson[key] = formatMultiline(parsedJson[key]);
         }
       });
 
@@ -380,8 +395,8 @@ ${dbtYaml}`;
       const rawResponse = await callNeuralEngine(remediationPrompt, true);
       const parsed = safeJsonParse(rawResponse);
 
-      const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
-      const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
+      const cleanSql = formatMultiline(parsed.sql || '');
+      const cleanYaml = formatMultiline(parsed.yaml || '');
 
       const healBanner = `/* [AI SELF-HEALED | Fix: ${analysisResult.healAction}] */`;
       const finalSql = cleanSql.startsWith('/* [AI') ? cleanSql : `${healBanner}\n${cleanSql}`;
