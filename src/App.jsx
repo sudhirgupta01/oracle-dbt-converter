@@ -113,7 +113,8 @@ export default function App() {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         let rawCode = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        return rawCode.replace(/^```[a-z]*\n?|^```\n?|```$/gm, '').trim();
+        // Clean markdown blocks safely
+        return rawCode.replace(/^```[a-zA-Z]*\n?/gm, '').replace(/```$/gm, '').trim();
       } catch (err) {
         clearTimeout(timeoutId);
         lastError = err;
@@ -133,18 +134,20 @@ export default function App() {
 
     const prompt = `You are a Principal Data Architect analyzing legacy Oracle PL/SQL for a dbt migration.
 dbt requires a Directed Acyclic Graph (DAG). Look for any circular dependencies, infinite loops, or deeply nested anti-patterns.
+
 Respond ONLY with a valid JSON object matching this exact structure:
 {
   "hasLoop": boolean,
-  "asciiDag": "string (Clean ASCII art showing the data lineage/tables)",
-  "errorMessage": "string (Brief explanation of the circular error, or null if clean)",
-  "suggestedCodeFix": "string (The rewritten PL/SQL code resolving the loop, or null if clean)"
+  "asciiDag": "string",
+  "errorMessage": "string or null",
+  "suggestedCodeFix": "string or null"
 }
 
-CRITICAL JSON RULES:
-1. Do NOT use markdown backticks.
-2. Do NOT use actual line breaks (newlines) inside string values. You MUST use the literal text '\\n' to represent line breaks in your ASCII art and code.
-3. Use single quotes (') instead of double quotes (") inside your strings, and escape any backslashes (\\\\).
+CRITICAL JSON PARSING RULES:
+1. Do NOT use markdown backticks around the JSON.
+2. Output the JSON completely flattened on a SINGLE LINE.
+3. NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your ASCII art or code rewrite. The system will replace ||| later.
+4. Escape any double quotes inside strings as \\".
 
 Oracle Source:
 ${sourceCode}`;
@@ -153,16 +156,16 @@ ${sourceCode}`;
       const jsonResponse = await callNeuralEngine(prompt);
       const parsed = JSON.parse(jsonResponse);
       
-      // Clean up any literal '\n' sequences in the response back to real line breaks for the UI to render
-      if (parsed.asciiDag) parsed.asciiDag = parsed.asciiDag.replace(/\\n/g, '\n');
-      if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = parsed.suggestedCodeFix.replace(/\\n/g, '\n');
+      // Safely swap the ||| placeholders back to real line breaks for rendering
+      if (parsed.asciiDag) parsed.asciiDag = parsed.asciiDag.replace(/\|\|\|/g, '\n');
+      if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = parsed.suggestedCodeFix.replace(/\|\|\|/g, '\n');
       
       setDagData(parsed);
       setDagStatus(parsed.hasLoop ? 'error' : 'clean');
       if (!parsed.hasLoop) showStatus('DAG Architecture clean. Pipeline unlocked for translation.');
     } catch (err) {
       setShowDagModal(false);
-      showStatus(`DAG Engine Error: Ensure AI returns valid JSON. ${err.message}`, true);
+      showStatus(`DAG Engine Error: ${err.message}`, true);
     } finally {
       setIsDagLoading(false);
     }
@@ -192,11 +195,13 @@ ${sourceCode}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture strictly optimized for ${targetLabel}.
-Ensure the SQL dialect used exactly matches ${targetLabel} conventions.
 Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
-- "sql": The dbt SELECT model tailored for ${targetLabel}.
-- "yaml": The dbt schema.yml definition with standard tests (unique, not_null).
-CRITICAL: Do NOT use markdown backticks, and escape any internal quotes. ONLY raw JSON.
+
+CRITICAL JSON PARSING RULES:
+1. Do NOT use markdown backticks around the JSON.
+2. Output the JSON completely flattened on a SINGLE LINE.
+3. NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your SQL or YAML code.
+4. Escape any double quotes inside strings as \\".
 
 Oracle Source:
 ${sourceCode}`;
@@ -204,12 +209,16 @@ ${sourceCode}`;
     try {
       const jsonResponse = await callNeuralEngine(prompt);
       const parsed = JSON.parse(jsonResponse);
-      setDbtSql(parsed.sql || '');
-      setDbtYaml(parsed.yaml || '');
+      
+      const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
+      const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
+      
+      setDbtSql(cleanSql);
+      setDbtYaml(cleanYaml);
       showStatus(`Translation complete for ${targetLabel}. Go to Dual Run Validation to verify and deploy.`);
-      generateDynamicScaffold(sourceCode, parsed.sql, parsed.yaml);
+      generateDynamicScaffold(sourceCode, cleanSql, cleanYaml);
     } catch (err) {
-      showStatus(`Engine Error: Ensure AI returns valid JSON. ${err.message}`, true);
+      showStatus(`Engine Error: ${err.message}`, true);
     } finally {
       setIsLoading(false);
     }
@@ -222,7 +231,7 @@ ${sourceCode}`;
 
     const scaffoldPrompt = `You are a Data Architect. Inspect this Oracle PL/SQL and the generated dbt SQL/YAML. 
 Design a tailored dbt repository folder tree (e.g., dbt_project.yml, models/staging, models/marts).${driftContext}
-Return ONLY a clean ASCII directory tree (using ├──, └──, │) with brief inline comments. Do NOT include markdown backticks.
+Return ONLY a clean ASCII directory tree (using ├──, └──, │) with brief inline comments. Do NOT include markdown backticks or JSON.
 
 PL/SQL: ${srcCode}
 dbt SQL: ${targetSql}`;
@@ -250,20 +259,22 @@ dbt SQL: ${targetSql}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
-Analyze this Oracle PL/SQL and its transpiled dbt equivalent. 
-Look for anti-patterns: un-migrated Oracle functions, incorrect dialect usage for ${targetLabel}, or missing unique/not_null tests.
+Analyze this Oracle PL/SQL and its transpiled dbt equivalent. Look for un-migrated Oracle functions or dialect errors.
 
-Respond ONLY with a valid JSON object. 
-CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values. DO NOT use actual newlines, use '\\n'.
-
+Respond ONLY with a valid JSON object:
 {
   "hasDrift": boolean,
-  "parityScore": "string percentage (e.g., '100.00%' or '72.14%')",
-  "driftType": "string (null if no drift, e.g., 'ORACLE_FUNCTION_LEAK', 'DIALECT_MISMATCH')",
-  "terminalDriftLog": "string explaining the risk (null if no drift)",
-  "healAction": "string describing the fix (null if no drift)",
-  "terminalHealLog": "string explaining the agent's fix (null if no drift)"
+  "parityScore": "string percentage",
+  "driftType": "string or null",
+  "terminalDriftLog": "string or null",
+  "healAction": "string or null",
+  "terminalHealLog": "string or null"
 }
+
+CRITICAL JSON PARSING RULES:
+1. Output completely flattened on a SINGLE LINE with no markdown backticks.
+2. NEVER use actual line breaks or \\n. Use the literal text ||| for line breaks if needed.
+3. Escape double quotes as \\".
 
 Oracle Source:
 ${sourceCode}
@@ -271,8 +282,16 @@ dbt SQL:
 ${dbtSql}`;
 
     try {
-      const rawJsonResponse = await callNeuralEngine(diagnosticPrompt);
-      const parsedJson = JSON.parse(rawJsonResponse);
+      const jsonResponse = await callNeuralEngine(diagnosticPrompt);
+      const parsedJson = JSON.parse(jsonResponse);
+      
+      // Clean placeholders if used
+      Object.keys(parsedJson).forEach(key => {
+        if (typeof parsedJson[key] === 'string') {
+          parsedJson[key] = parsedJson[key].replace(/\|\|\|/g, '\n');
+        }
+      });
+      
       setAnalysisResult(parsedJson);
       showStatus(`Dual Run validation complete.`);
       if (parsedJson.hasDrift) generateDynamicScaffold(sourceCode, dbtSql, dbtYaml, parsedJson);
@@ -292,8 +311,12 @@ ${dbtSql}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
-Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
-Do NOT use markdown formatting. ONLY raw JSON.
+Respond ONLY with a valid JSON object containing keys: "sql" and "yaml".
+
+CRITICAL JSON PARSING RULES:
+1. Output completely flattened on a SINGLE LINE with no markdown backticks.
+2. NEVER use actual line breaks or \\n. Use the literal text ||| for line breaks.
+3. Escape double quotes as \\".
 
 Current SQL:
 ${dbtSql}
@@ -304,16 +327,19 @@ ${dbtYaml}`;
       const jsonResponse = await callNeuralEngine(remediationPrompt);
       const parsed = JSON.parse(jsonResponse);
       
+      const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
+      const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
+      
       const healBanner = `/* [AI SELF-HEALED | Fix: ${analysisResult.healAction}] */`;
-      const finalSql = parsed.sql.startsWith('/* [AI') ? parsed.sql : `${healBanner}\n${parsed.sql}`;
+      const finalSql = cleanSql.startsWith('/* [AI') ? cleanSql : `${healBanner}\n${cleanSql}`;
       
       setDbtSql(finalSql);
-      if(parsed.yaml) setDbtYaml(parsed.yaml);
+      if(cleanYaml) setDbtYaml(cleanYaml);
       
       setIsSelfHealedCode(true);
       setAiSelfHealing(true);
       showStatus(`Self-Healing complete: dbt models patched for ${analysisResult.driftType}.`);
-      generateDynamicScaffold(sourceCode, finalSql, parsed.yaml, analysisResult);
+      generateDynamicScaffold(sourceCode, finalSql, cleanYaml, analysisResult);
     } catch (err) {
       showStatus(`Self-Healing Error: ${err.message}`, true);
     } finally {
@@ -323,7 +349,7 @@ ${dbtYaml}`;
 
   // 6. GitHub Deploy
   const pushFileToGitHub = async (fileName, fileContent) => {
-    const url = `[https://api.github.com/repos/$](https://api.github.com/repos/$){gitOwner}/${gitRepo}/contents/models/${fileName}`;
+    const url = `https://api.github.com/repos/${gitOwner}/${gitRepo}/contents/models/${fileName}`;
     const contentBase64 = btoa(unescape(encodeURIComponent(fileContent)));
     let sha = null;
     
