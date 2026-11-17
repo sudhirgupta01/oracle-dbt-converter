@@ -135,12 +135,16 @@ export default function App() {
 dbt requires a Directed Acyclic Graph (DAG). Look for any circular dependencies, infinite loops, or deeply nested anti-patterns.
 Respond ONLY with a valid JSON object matching this exact structure:
 {
-  "hasLoop": boolean (true if circular dependency exists),
+  "hasLoop": boolean,
   "asciiDag": "string (Clean ASCII art showing the data lineage/tables)",
   "errorMessage": "string (Brief explanation of the circular error, or null if clean)",
-  "suggestedCodeFix": "string (The complete rewritten PL/SQL code resolving the loop to point to base tables, or null if clean)"
+  "suggestedCodeFix": "string (The rewritten PL/SQL code resolving the loop, or null if clean)"
 }
-CRITICAL: Do NOT use markdown backticks around the JSON. Use single quotes inside string values.
+
+CRITICAL JSON RULES:
+1. Do NOT use markdown backticks.
+2. Do NOT use actual line breaks (newlines) inside string values. You MUST use the literal text '\\n' to represent line breaks in your ASCII art and code.
+3. Use single quotes (') instead of double quotes (") inside your strings, and escape any backslashes (\\\\).
 
 Oracle Source:
 ${sourceCode}`;
@@ -148,12 +152,17 @@ ${sourceCode}`;
     try {
       const jsonResponse = await callNeuralEngine(prompt);
       const parsed = JSON.parse(jsonResponse);
+      
+      // Clean up any literal '\n' sequences in the response back to real line breaks for the UI to render
+      if (parsed.asciiDag) parsed.asciiDag = parsed.asciiDag.replace(/\\n/g, '\n');
+      if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = parsed.suggestedCodeFix.replace(/\\n/g, '\n');
+      
       setDagData(parsed);
       setDagStatus(parsed.hasLoop ? 'error' : 'clean');
       if (!parsed.hasLoop) showStatus('DAG Architecture clean. Pipeline unlocked for translation.');
     } catch (err) {
       setShowDagModal(false);
-      showStatus(`DAG Engine Error: ${err.message}`, true);
+      showStatus(`DAG Engine Error: Ensure AI returns valid JSON. ${err.message}`, true);
     } finally {
       setIsDagLoading(false);
     }
@@ -245,7 +254,7 @@ Analyze this Oracle PL/SQL and its transpiled dbt equivalent.
 Look for anti-patterns: un-migrated Oracle functions, incorrect dialect usage for ${targetLabel}, or missing unique/not_null tests.
 
 Respond ONLY with a valid JSON object. 
-CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values.
+CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values. DO NOT use actual newlines, use '\\n'.
 
 {
   "hasDrift": boolean,
