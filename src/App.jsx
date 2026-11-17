@@ -6,7 +6,6 @@ const ENGINE_MODELS = [
   'gemini-3.1-flash-lite'
 ];
 
-// Expanded Target Data Warehouses
 const DB_TARGETS = [
   { id: 'snowflake', label: 'Snowflake' },
   { id: 'bigquery', label: 'Google BigQuery' },
@@ -19,21 +18,26 @@ const DB_TARGETS = [
 export default function App() {
   const [activeTab, setActiveTab] = useState('transpiler');
   
+  // Core Code States
   const [sourceCode, setSourceCode] = useState('');
   const [targetDb, setTargetDb] = useState('snowflake');
   const [dbtSql, setDbtSql] = useState('');
   const [dbtYaml, setDbtYaml] = useState('');
   
+  // UI & Loading States
   const [isLoading, setIsLoading] = useState(false);
-  const [isDagLoading, setIsDagLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [isError, setIsError] = useState(false);
+
+  // DAG Analysis & Human-in-the-Loop States
+  const [isDagLoading, setIsDagLoading] = useState(false);
+  const [showDagModal, setShowDagModal] = useState(false);
+  const [dagStatus, setDagStatus] = useState('pending'); // 'pending', 'clean', 'error'
+  const [dagData, setDagData] = useState(null);
 
   // Modals & Config
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showGitModal, setShowGitModal] = useState(false);
-  const [showDagModal, setShowDagModal] = useState(false);
-  const [dagContent, setDagContent] = useState('');
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('oracle_engine_key') || '');
   
   // GitHub State
@@ -54,6 +58,7 @@ export default function App() {
   const [isRemediating, setIsRemediating] = useState(false);
   const [isSelfHealedCode, setIsSelfHealedCode] = useState(false);
 
+  // Config Handlers
   const saveConfig = () => {
     localStorage.setItem('oracle_engine_key', apiKey.trim());
     setShowConfigModal(false);
@@ -79,6 +84,14 @@ export default function App() {
     setAnalysisResult(null);
     setAiSelfHealing(false);
     setIsSelfHealedCode(false);
+  };
+
+  // If user edits code manually, reset the DAG lock
+  const handleSourceChange = (e) => {
+    setSourceCode(e.target.value);
+    setDagStatus('pending');
+    setDagData(null);
+    resetGeneratedStates();
   };
 
   const callNeuralEngine = async (promptText) => {
@@ -109,9 +122,57 @@ export default function App() {
     throw lastError || new Error('Neural Engine failed to respond.');
   };
 
-  const handleTranspile = async () => {
-    if (!sourceCode.trim()) return showStatus('Please paste Oracle PL/SQL code first.', true);
+  // 1. DAG Analyzer (Human-in-the-Loop Gatekeeper)
+  const handleAnalyzeDAG = async () => {
+    if (!sourceCode.trim()) return showStatus('Please paste Oracle code first to analyze lineage.', true);
     if (!apiKey.trim()) return showStatus('Please configure your Engine API Key.', true);
+
+    setIsDagLoading(true);
+    setShowDagModal(true);
+    setDagData(null);
+
+    const prompt = `You are a Principal Data Architect analyzing legacy Oracle PL/SQL for a dbt migration.
+dbt requires a Directed Acyclic Graph (DAG). Look for any circular dependencies, infinite loops, or deeply nested anti-patterns.
+Respond ONLY with a valid JSON object matching this exact structure:
+{
+  "hasLoop": boolean (true if circular dependency exists),
+  "asciiDag": "string (Clean ASCII art showing the data lineage/tables)",
+  "errorMessage": "string (Brief explanation of the circular error, or null if clean)",
+  "suggestedCodeFix": "string (The complete rewritten PL/SQL code resolving the loop to point to base tables, or null if clean)"
+}
+CRITICAL: Do NOT use markdown backticks around the JSON. Use single quotes inside string values.
+
+Oracle Source:
+${sourceCode}`;
+
+    try {
+      const jsonResponse = await callNeuralEngine(prompt);
+      const parsed = JSON.parse(jsonResponse);
+      setDagData(parsed);
+      setDagStatus(parsed.hasLoop ? 'error' : 'clean');
+      if (!parsed.hasLoop) showStatus('DAG Architecture clean. Pipeline unlocked for translation.');
+    } catch (err) {
+      setShowDagModal(false);
+      showStatus(`DAG Engine Error: ${err.message}`, true);
+    } finally {
+      setIsDagLoading(false);
+    }
+  };
+
+  const applyDagFix = () => {
+    if (dagData && dagData.suggestedCodeFix) {
+      setSourceCode(dagData.suggestedCodeFix);
+      setDagStatus('clean');
+      setShowDagModal(false);
+      showStatus('✅ Architectural fix applied. Pipeline unlocked for translation.');
+    }
+  };
+
+  // 2. Code Conversion
+  const handleTranspile = async () => {
+    if (dagStatus !== 'clean') {
+      return showStatus('Pipeline Blocked: Please Analyze DAG and resolve architecture risks first.', true);
+    }
 
     setIsLoading(true);
     setDbtSql('');
@@ -122,7 +183,7 @@ export default function App() {
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture strictly optimized for ${targetLabel}.
-Ensure the SQL dialect used exactly matches ${targetLabel} conventions (e.g., timestamp handling, null coalescing, string concatenation).
+Ensure the SQL dialect used exactly matches ${targetLabel} conventions.
 Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
 - "sql": The dbt SELECT model tailored for ${targetLabel}.
 - "yaml": The dbt schema.yml definition with standard tests (unique, not_null).
@@ -145,28 +206,7 @@ ${sourceCode}`;
     }
   };
 
-  const handleAnalyzeDAG = async () => {
-    if (!sourceCode.trim()) return showStatus('Please paste Oracle code first to analyze lineage.', true);
-    if (!apiKey.trim()) return showStatus('Please configure your Engine API Key.', true);
-
-    setIsDagLoading(true);
-    setShowDagModal(true);
-    setDagContent('Analyzing PL/SQL dependencies and generating dbt lineage DAG...');
-
-    const prompt = `Analyze this Oracle PL/SQL and generate an ASCII art Directed Acyclic Graph (DAG) showing how the data flows from source tables into the final dbt model. 
-Return ONLY the raw ASCII art, no markdown backticks.
-Code: ${sourceCode}`;
-
-    try {
-      const asciiDag = await callNeuralEngine(prompt);
-      setDagContent(asciiDag);
-    } catch (err) {
-      setDagContent(`Error generating DAG: ${err.message}`);
-    } finally {
-      setIsDagLoading(false);
-    }
-  };
-
+  // 3. Dynamic Scaffolder
   const generateDynamicScaffold = async (srcCode, targetSql, targetYaml, driftInfo = null) => {
     setIsScaffolding(true);
     const driftContext = driftInfo?.hasDrift ? `\nNote: Validator flagged ${driftInfo.driftType}. Include the fix in the tree.` : '';
@@ -188,9 +228,9 @@ dbt SQL: ${targetSql}`;
     }
   };
 
+  // 4. Dual Run Validation
   const handleAnalyzeArchitecture = async () => {
-    if (!dbtSql.trim()) return;
-    if (!apiKey.trim()) return;
+    if (!dbtSql.trim() || !apiKey.trim()) return;
 
     setIsAnalyzing(true);
     setValidationRun(true);
@@ -202,10 +242,10 @@ dbt SQL: ${targetSql}`;
 
     const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
 Analyze this Oracle PL/SQL and its transpiled dbt equivalent. 
-Look for anti-patterns: un-migrated Oracle functions (like DECODE or SYSDATE), incorrect dialect usage for ${targetLabel}, missing unique/not_null tests in the YAML, or hardcoded schemas instead of {{ ref() }}.
+Look for anti-patterns: un-migrated Oracle functions, incorrect dialect usage for ${targetLabel}, or missing unique/not_null tests.
 
 Respond ONLY with a valid JSON object. 
-CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values, never double quotes (").
+CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values.
 
 {
   "hasDrift": boolean,
@@ -225,7 +265,7 @@ ${dbtSql}`;
       const rawJsonResponse = await callNeuralEngine(diagnosticPrompt);
       const parsedJson = JSON.parse(rawJsonResponse);
       setAnalysisResult(parsedJson);
-      showStatus(`Architecture validation complete.`);
+      showStatus(`Dual Run validation complete.`);
       if (parsedJson.hasDrift) generateDynamicScaffold(sourceCode, dbtSql, dbtYaml, parsedJson);
     } catch (err) {
       setValidationRun(false);
@@ -235,6 +275,7 @@ ${dbtSql}`;
     }
   };
 
+  // 5. Self Healing
   const triggerSelfHealingRemediation = async () => {
     if (!dbtSql.trim() || !analysisResult?.hasDrift) return;
     setIsRemediating(true);
@@ -271,6 +312,7 @@ ${dbtYaml}`;
     }
   };
 
+  // 6. GitHub Deploy
   const pushFileToGitHub = async (fileName, fileContent) => {
     const url = `[https://api.github.com/repos/$](https://api.github.com/repos/$){gitOwner}/${gitRepo}/contents/models/${fileName}`;
     const contentBase64 = btoa(unescape(encodeURIComponent(fileContent)));
@@ -359,11 +401,20 @@ ${dbtYaml}`;
         <main className="flex-1 flex flex-col p-6 gap-4 w-full mx-auto">
           <div className="flex justify-between bg-[#111928] p-3 rounded-xl border border-slate-800 items-center">
             <div className="flex gap-2">
-              <button onClick={handleTranspile} disabled={isLoading} className="bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
-                {isLoading ? 'Synthesising via Neural Engine...' : '▷ Run dbt Translation'}
+              <button 
+                onClick={handleAnalyzeDAG} 
+                disabled={isDagLoading || !sourceCode.trim()} 
+                className="bg-slate-800 text-cyan-400 border border-cyan-900/50 hover:bg-slate-700 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2"
+              >
+                {isDagLoading ? 'Analyzing Lineage...' : '🕸️ Analyze DAG & Verify Dependencies'}
               </button>
-              <button onClick={handleAnalyzeDAG} disabled={isDagLoading} className="bg-slate-800 text-cyan-400 border border-cyan-900/50 hover:bg-slate-700 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
-                {isDagLoading ? 'Analyzing Lineage...' : '🕸️ Analyze DAG'}
+              
+              <button 
+                onClick={handleTranspile} 
+                disabled={isLoading || dagStatus !== 'clean'} 
+                className={`${dagStatus === 'clean' ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-slate-800 opacity-50 cursor-not-allowed'} text-white px-6 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2`}
+              >
+                {isLoading ? 'Synthesising via Neural Engine...' : dagStatus === 'clean' ? '▷ Run dbt Translation' : '🔒 Locked: Analyze DAG First'}
               </button>
             </div>
           </div>
@@ -372,8 +423,9 @@ ${dbtYaml}`;
             <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800">
               <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
                 <span className="text-xs font-semibold text-slate-400">INPUT: Oracle PL/SQL</span>
+                {dagStatus === 'clean' && <span className="bg-emerald-500/15 text-emerald-300 text-[10px] px-2 py-0.5 rounded border border-emerald-500/30">✓ DAG Verified</span>}
               </div>
-              <textarea value={sourceCode} onChange={(e) => setSourceCode(e.target.value)} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-slate-200 outline-none" placeholder="Paste Oracle PL/SQL Stored Procedure or View here..." spellCheck={false} />
+              <textarea value={sourceCode} onChange={handleSourceChange} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-slate-200 outline-none focus:ring-1 ring-indigo-500/50 rounded-b-xl transition-all" placeholder="Paste Oracle PL/SQL Stored Procedure or View here..." spellCheck={false} />
             </div>
 
             <div className="flex flex-col gap-4">
@@ -403,6 +455,7 @@ ${dbtYaml}`;
         </main>
       )}
 
+      {/* Scaffolder Tab */}
       {activeTab === 'scaffolder' && (
         <main className="flex-1 p-8 max-w-6xl mx-auto w-full">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 mb-6 flex justify-between items-center">
@@ -429,6 +482,7 @@ ${dbtYaml}`;
         </main>
       )}
 
+      {/* Dual Run Validation Tab */}
       {activeTab === 'dualrun' && (
         <main className="flex-1 p-8 max-w-6xl mx-auto w-full space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -534,22 +588,54 @@ ${dbtYaml}`;
         </main>
       )}
 
-      {/* DAG Modal */}
+      {/* DAG Interactive Approval Modal */}
       {showDagModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
-          <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-3xl w-full flex flex-col gap-4">
-            <h3 className="font-bold text-white text-sm">Lineage DAG Explorer</h3>
-            <div className="bg-slate-950 border border-slate-700 rounded-xl p-4 font-mono text-[10px] text-cyan-300 overflow-x-auto min-h-[200px]">
-              <pre>{dagContent}</pre>
+          <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-4xl w-full flex flex-col gap-4">
+            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-white text-sm">Lineage DAG Explorer</h3>
+              {isDagLoading ? (
+                <span className="text-cyan-400 text-xs animate-pulse">Scanning dependencies...</span>
+              ) : (
+                <span className={`text-xs font-bold px-2.5 py-1 rounded border ${dagData?.hasLoop ? 'bg-rose-500/10 text-rose-400 border-rose-500/20' : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'}`}>
+                  {dagData?.hasLoop ? 'Circular Dependency Detected' : 'DAG Verified Clean'}
+                </span>
+              )}
             </div>
-            <div className="flex justify-end">
-              <button onClick={() => setShowDagModal(false)} className="bg-indigo-600 text-white px-4 py-2 rounded text-xs">Close</button>
+            
+            <div className="bg-slate-950 border border-slate-700 rounded-xl p-4 font-mono text-xs text-cyan-300 overflow-x-auto min-h-[200px]">
+              {isDagLoading ? (
+                <div className="text-slate-500">Mapping entity relationships...</div>
+              ) : (
+                <pre>{dagData?.asciiDag || 'No visual DAG generated.'}</pre>
+              )}
             </div>
+
+            {!isDagLoading && dagData?.hasLoop && (
+              <div className="bg-rose-950/30 border border-rose-900/50 p-4 rounded-xl mt-2">
+                <p className="text-rose-400 text-xs font-bold mb-2">⚠️ Architecture Risk: {dagData.errorMessage}</p>
+                <div className="bg-slate-950 p-3 rounded border border-rose-900/50 font-mono text-[10px] text-slate-300 overflow-x-auto mb-3">
+                  <pre>{dagData.suggestedCodeFix}</pre>
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setShowDagModal(false)} className="text-slate-400 hover:text-white text-xs px-4 py-2">Reject & Edit Manually</button>
+                  <button onClick={applyDagFix} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded text-xs font-bold shadow">
+                    Approve & Apply Architectural Fix
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {!isDagLoading && !dagData?.hasLoop && (
+              <div className="flex justify-end pt-2">
+                <button onClick={() => setShowDagModal(false)} className="bg-indigo-600 text-white px-6 py-2 rounded text-xs font-bold">Continue to Translation</button>
+              </div>
+            )}
           </div>
         </div>
       )}
 
-      {/* Modals */}
+      {/* Config Modals */}
       {showConfigModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-md w-full flex flex-col gap-4 text-xs">
