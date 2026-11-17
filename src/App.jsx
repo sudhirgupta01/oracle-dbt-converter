@@ -6,11 +6,14 @@ const ENGINE_MODELS = [
   'gemini-3.1-flash-lite'
 ];
 
+// Expanded Target Data Warehouses
 const DB_TARGETS = [
   { id: 'snowflake', label: 'Snowflake' },
   { id: 'bigquery', label: 'Google BigQuery' },
   { id: 'databricks', label: 'Databricks SQL' },
-  { id: 'redshift', label: 'Amazon Redshift' }
+  { id: 'redshift', label: 'Amazon Redshift' },
+  { id: 'synapse', label: 'Azure Synapse Analytics' },
+  { id: 'postgres', label: 'PostgreSQL' }
 ];
 
 export default function App() {
@@ -118,9 +121,10 @@ export default function App() {
 
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
-    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture optimized for ${targetLabel}.
+    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture strictly optimized for ${targetLabel}.
+Ensure the SQL dialect used exactly matches ${targetLabel} conventions (e.g., timestamp handling, null coalescing, string concatenation).
 Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
-- "sql": The dbt SELECT model (use ${targetLabel} specific syntax if needed, map NVL to COALESCE, etc.).
+- "sql": The dbt SELECT model tailored for ${targetLabel}.
 - "yaml": The dbt schema.yml definition with standard tests (unique, not_null).
 CRITICAL: Do NOT use markdown backticks, and escape any internal quotes. ONLY raw JSON.
 
@@ -194,9 +198,11 @@ dbt SQL: ${targetSql}`;
     setAiSelfHealing(false);
     showStatus('');
 
-    const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator.
+    const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
+
+    const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
 Analyze this Oracle PL/SQL and its transpiled dbt equivalent. 
-Look for anti-patterns: un-migrated Oracle functions (like DECODE or SYSDATE), missing unique/not_null tests in the YAML, or hardcoded schemas instead of {{ ref() }}.
+Look for anti-patterns: un-migrated Oracle functions (like DECODE or SYSDATE), incorrect dialect usage for ${targetLabel}, missing unique/not_null tests in the YAML, or hardcoded schemas instead of {{ ref() }}.
 
 Respond ONLY with a valid JSON object. 
 CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values, never double quotes (").
@@ -204,7 +210,7 @@ CRITICAL RULES: No markdown backticks. Use single quotes (') inside string value
 {
   "hasDrift": boolean,
   "parityScore": "string percentage (e.g., '100.00%' or '72.14%')",
-  "driftType": "string (null if no drift, e.g., 'ORACLE_FUNCTION_LEAK', 'MISSING_DATA_TESTS')",
+  "driftType": "string (null if no drift, e.g., 'ORACLE_FUNCTION_LEAK', 'DIALECT_MISMATCH')",
   "terminalDriftLog": "string explaining the risk (null if no drift)",
   "healAction": "string describing the fix (null if no drift)",
   "terminalHealLog": "string explaining the agent's fix (null if no drift)"
@@ -233,7 +239,9 @@ ${dbtSql}`;
     if (!dbtSql.trim() || !analysisResult?.hasDrift) return;
     setIsRemediating(true);
 
-    const remediationPrompt = `You are a dbt remediation agent. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
+    const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
+
+    const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
 Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
 Do NOT use markdown formatting. ONLY raw JSON.
 
