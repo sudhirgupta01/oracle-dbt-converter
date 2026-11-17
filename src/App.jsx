@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 
 const ENGINE_MODELS = [
-  'gemini-3.8-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-3.1-flash-lite'
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-2.5-pro'
 ];
 
 const DB_TARGETS = [
@@ -17,13 +17,13 @@ const DB_TARGETS = [
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('transpiler');
-  
+
   // Core Code States
   const [sourceCode, setSourceCode] = useState('');
   const [targetDb, setTargetDb] = useState('snowflake');
   const [dbtSql, setDbtSql] = useState('');
   const [dbtYaml, setDbtYaml] = useState('');
-  
+
   // UI & Loading States
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
@@ -39,7 +39,7 @@ export default function App() {
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showGitModal, setShowGitModal] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('oracle_engine_key') || '');
-  
+
   // GitHub State
   const [gitToken, setGitToken] = useState(() => localStorage.getItem('github_pat') || '');
   const [gitOwner, setGitOwner] = useState(() => localStorage.getItem('github_owner') || '');
@@ -93,41 +93,98 @@ export default function App() {
     resetGeneratedStates();
   };
 
-  // BRUTE-FORCE JSON EXTRACTOR: Ignores all AI conversational filler and markdown
   const safeJsonParse = (rawStr) => {
     const start = rawStr.indexOf('{');
     const end = rawStr.lastIndexOf('}');
     if (start === -1 || end === -1) {
-      throw new Error('No JSON structure detected in the engine response.');
+      throw new Error('Invalid structured response from Neural Engine.');
     }
     const cleanStr = rawStr.substring(start, end + 1);
     return JSON.parse(cleanStr);
   };
 
-  const callNeuralEngine = async (promptText) => {
+  const executeModelRequest = async (modelName, promptText, expectJson, cleanKey) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    const payload = {
+      contents: [{ parts: [{ text: promptText }] }]
+    };
+    if (expectJson) {
+      payload.generationConfig = { responseMimeType: 'application/json' };
+    }
+
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify(payload)
+        }
+      );
+      clearTimeout(timeoutId);
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        const reason = errBody?.error?.message || `HTTP ${response.status}`;
+        const err = new Error(reason);
+        err.status = response.status;
+        throw err;
+      }
+      const data = await response.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } catch (err) {
+      clearTimeout(timeoutId);
+      throw err;
+    }
+  };
+
+  const callNeuralEngine = async (promptText, expectJson = false) => {
+    const cleanKey = apiKey.trim();
     let lastError = null;
+
+    // 1. Try primary known production endpoints
     for (const modelName of ENGINE_MODELS) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 20000);
       try {
-        const response = await fetch(
-          `[https://generativelanguage.googleapis.com/v1beta/models/$](https://generativelanguage.googleapis.com/v1beta/models/$){modelName}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: controller.signal,
-            body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }] })
-          }
-        );
-        clearTimeout(timeoutId);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const text = await executeModelRequest(modelName, promptText, expectJson, cleanKey);
+        if (text) return text;
       } catch (err) {
-        clearTimeout(timeoutId);
         lastError = err;
+        // Stop immediately on invalid API key (400/403)
+        if (err.status === 400 || err.status === 403) {
+          throw new Error(`Authentication failed (${err.message}). Verify your Engine API Key.`);
+        }
       }
     }
+
+    // 2. Auto-discover an active model on the user's API key if primary endpoints returned 404
+    try {
+      const listRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(cleanKey)}`
+      );
+      if (listRes.ok) {
+        const listData = await listRes.json();
+        const available = (listData.models || []).find(
+          (m) =>
+            Array.isArray(m.supportedGenerationMethods) &&
+            m.supportedGenerationMethods.includes('generateContent') &&
+            m.name.includes('flash')
+        ) || (listData.models || []).find(
+          (m) =>
+            Array.isArray(m.supportedGenerationMethods) &&
+            m.supportedGenerationMethods.includes('generateContent')
+        );
+
+        if (available && available.name) {
+          const discoveredId = available.name.replace(/^models\//, '');
+          const text = await executeModelRequest(discoveredId, promptText, expectJson, cleanKey);
+          if (text) return text;
+        }
+      }
+    } catch (discoveryErr) {
+      lastError = discoveryErr;
+    }
+
     throw lastError || new Error('Neural Engine failed to respond.');
   };
 
@@ -143,27 +200,24 @@ export default function App() {
     const prompt = `You are a Principal Data Architect analyzing legacy Oracle PL/SQL for a dbt migration.
 dbt requires a Directed Acyclic Graph (DAG). Look for any circular dependencies, infinite loops, or deeply nested anti-patterns.
 
-Respond ONLY with a valid JSON object matching this exact structure:
+Return a JSON object with this exact schema:
 {
   "hasLoop": boolean,
-  "asciiDag": "string",
-  "errorMessage": "string or null",
-  "suggestedCodeFix": "string or null"
+  "asciiDag": "string (clean ASCII lineage diagram using \\n for newlines)",
+  "errorMessage": "string or null (explanation if circular dependency exists)",
+  "suggestedCodeFix": "string or null (complete rewritten PL/SQL code resolving the loop using \\n for newlines)"
 }
-
-CRITICAL JSON PARSING RULES:
-NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your ASCII art or code rewrite.
 
 Oracle Source:
 ${sourceCode}`;
 
     try {
-      const rawResponse = await callNeuralEngine(prompt);
+      const rawResponse = await callNeuralEngine(prompt, true);
       const parsed = safeJsonParse(rawResponse);
-      
+
       if (parsed.asciiDag) parsed.asciiDag = parsed.asciiDag.replace(/\|\|\|/g, '\n');
       if (parsed.suggestedCodeFix) parsed.suggestedCodeFix = parsed.suggestedCodeFix.replace(/\|\|\|/g, '\n');
-      
+
       setDagData(parsed);
       setDagStatus(parsed.hasLoop ? 'error' : 'clean');
       if (!parsed.hasLoop) showStatus('DAG Architecture clean. Pipeline unlocked for translation.');
@@ -199,22 +253,24 @@ ${sourceCode}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture strictly optimized for ${targetLabel}.
-Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
+Ensure the SQL dialect used matches ${targetLabel} conventions.
 
-CRITICAL JSON PARSING RULES:
-NEVER use actual line breaks (newlines) or \\n inside string values. Instead, use the literal text ||| wherever a line break should be in your SQL or YAML code.
-Escape any double quotes inside strings as \\".
+Return a JSON object with this exact schema:
+{
+  "sql": "string (the dbt SELECT model tailored for ${targetLabel})",
+  "yaml": "string (the dbt schema.yml definition with standard tests like unique and not_null)"
+}
 
 Oracle Source:
 ${sourceCode}`;
 
     try {
-      const rawResponse = await callNeuralEngine(prompt);
+      const rawResponse = await callNeuralEngine(prompt, true);
       const parsed = safeJsonParse(rawResponse);
-      
+
       const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
       const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
-      
+
       setDbtSql(cleanSql);
       setDbtYaml(cleanYaml);
       showStatus(`Translation complete for ${targetLabel}. Go to Dual Run Validation to verify and deploy.`);
@@ -239,8 +295,7 @@ PL/SQL: ${srcCode}
 dbt SQL: ${targetSql}`;
 
     try {
-      let rawTree = await callNeuralEngine(scaffoldPrompt);
-      // Clean possible backticks from non-JSON AI response
+      let rawTree = await callNeuralEngine(scaffoldPrompt, false);
       rawTree = rawTree.replace(/^```[a-zA-Z]*\n?/gm, '').replace(/```$/gm, '').trim();
       setScaffoldTree(rawTree);
     } catch {
@@ -263,21 +318,17 @@ dbt SQL: ${targetSql}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
-Analyze this Oracle PL/SQL and its transpiled dbt equivalent. Look for un-migrated Oracle functions or dialect errors.
+Analyze this Oracle PL/SQL and its transpiled dbt equivalent. Look for un-migrated Oracle functions, dialect errors for ${targetLabel}, or missing dbt tests.
 
-Respond ONLY with a valid JSON object:
+Return a JSON object with this exact schema:
 {
   "hasDrift": boolean,
-  "parityScore": "string percentage",
-  "driftType": "string or null",
-  "terminalDriftLog": "string or null",
-  "healAction": "string or null",
-  "terminalHealLog": "string or null"
+  "parityScore": "string percentage (e.g., '100.00%' or '72.14%')",
+  "driftType": "string or null (e.g., 'ORACLE_FUNCTION_LEAK', 'DIALECT_MISMATCH')",
+  "terminalDriftLog": "string or null (detailed explanation of the risk)",
+  "healAction": "string or null (short description of the fix)",
+  "terminalHealLog": "string or null (explanation of what the self-healing agent will patch)"
 }
-
-CRITICAL JSON PARSING RULES:
-NEVER use actual line breaks or \\n in strings. Use the literal text ||| for line breaks if needed.
-Escape double quotes as \\".
 
 Oracle Source:
 ${sourceCode}
@@ -285,15 +336,15 @@ dbt SQL:
 ${dbtSql}`;
 
     try {
-      const rawResponse = await callNeuralEngine(diagnosticPrompt);
+      const rawResponse = await callNeuralEngine(diagnosticPrompt, true);
       const parsedJson = safeJsonParse(rawResponse);
-      
+
       Object.keys(parsedJson).forEach(key => {
         if (typeof parsedJson[key] === 'string') {
           parsedJson[key] = parsedJson[key].replace(/\|\|\|/g, '\n');
         }
       });
-      
+
       setAnalysisResult(parsedJson);
       showStatus(`Dual Run validation complete.`);
       if (parsedJson.hasDrift) generateDynamicScaffold(sourceCode, dbtSql, dbtYaml, parsedJson);
@@ -313,11 +364,12 @@ ${dbtSql}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
-Respond ONLY with a valid JSON object containing keys: "sql" and "yaml".
 
-CRITICAL JSON PARSING RULES:
-NEVER use actual line breaks or \\n. Use the literal text ||| for line breaks.
-Escape double quotes as \\".
+Return a JSON object with this exact schema:
+{
+  "sql": "string (the complete refactored ${targetLabel} dbt SQL)",
+  "yaml": "string (the complete updated dbt schema.yml)"
+}
 
 Current SQL:
 ${dbtSql}
@@ -325,18 +377,18 @@ Current YAML:
 ${dbtYaml}`;
 
     try {
-      const rawResponse = await callNeuralEngine(remediationPrompt);
+      const rawResponse = await callNeuralEngine(remediationPrompt, true);
       const parsed = safeJsonParse(rawResponse);
-      
+
       const cleanSql = (parsed.sql || '').replace(/\|\|\|/g, '\n');
       const cleanYaml = (parsed.yaml || '').replace(/\|\|\|/g, '\n');
-      
+
       const healBanner = `/* [AI SELF-HEALED | Fix: ${analysisResult.healAction}] */`;
       const finalSql = cleanSql.startsWith('/* [AI') ? cleanSql : `${healBanner}\n${cleanSql}`;
-      
+
       setDbtSql(finalSql);
-      if(cleanYaml) setDbtYaml(cleanYaml);
-      
+      if (cleanYaml) setDbtYaml(cleanYaml);
+
       setIsSelfHealedCode(true);
       setAiSelfHealing(true);
       showStatus(`Self-Healing complete: dbt models patched for ${analysisResult.driftType}.`);
@@ -349,11 +401,20 @@ ${dbtYaml}`;
   };
 
   // 6. GitHub Deploy
+  const encodeBase64 = (str) => {
+    const bytes = new TextEncoder().encode(str);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  };
+
   const pushFileToGitHub = async (fileName, fileContent) => {
-    const url = `[https://api.github.com/repos/$](https://api.github.com/repos/$){gitOwner}/${gitRepo}/contents/models/${fileName}`;
-    const contentBase64 = btoa(unescape(encodeURIComponent(fileContent)));
+    const url = `https://api.github.com/repos/${gitOwner}/${gitRepo}/contents/models/${fileName}`;
+    const contentBase64 = encodeBase64(fileContent);
     let sha = null;
-    
+
     try {
       const getRes = await fetch(url, { headers: { 'Authorization': `Bearer ${gitToken}` } });
       if (getRes.ok) {
@@ -437,24 +498,24 @@ ${dbtYaml}`;
         <main className="flex-1 flex flex-col p-6 gap-4 w-full mx-auto">
           <div className="flex justify-between bg-[#111928] p-3 rounded-xl border border-slate-800 items-center">
             <div className="flex gap-2">
-              <button 
-                onClick={handleAnalyzeDAG} 
-                disabled={isDagLoading || !sourceCode.trim()} 
+              <button
+                onClick={handleAnalyzeDAG}
+                disabled={isDagLoading || !sourceCode.trim()}
                 className="bg-slate-800 text-cyan-400 border border-cyan-900/50 hover:bg-slate-700 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2"
               >
                 {isDagLoading ? 'Analyzing Lineage...' : '🕸️ Analyze DAG & Verify Dependencies'}
               </button>
-              
-              <button 
-                onClick={handleTranspile} 
-                disabled={isLoading || dagStatus !== 'clean'} 
+
+              <button
+                onClick={handleTranspile}
+                disabled={isLoading || dagStatus !== 'clean'}
                 className={`${dagStatus === 'clean' ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-slate-800 opacity-50 cursor-not-allowed'} text-white px-6 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2`}
               >
                 {isLoading ? 'Synthesising via Neural Engine...' : dagStatus === 'clean' ? '▷ Run dbt Translation' : '🔒 Locked: Analyze DAG First'}
               </button>
             </div>
           </div>
-          
+
           <div className="grid grid-cols-2 gap-4 flex-1">
             <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800">
               <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
@@ -550,7 +611,7 @@ ${dbtYaml}`;
                 </button>
               </div>
             </div>
-            
+
             {hasGeneratedCode && validationRun && analysisResult ? (
               <div className="grid grid-cols-4 px-6 py-4 items-center text-xs text-slate-300 gap-2">
                 <div className="font-mono text-cyan-300">Generated dbt Model</div>
@@ -578,10 +639,10 @@ ${dbtYaml}`;
                 </div>
               </div>
             ) : (
-               <div className="py-16 text-center text-xs text-slate-400">
-                {isAnalyzing ? <span className="text-cyan-400 animate-pulse">Scanning dbt architecture...</span> 
-                : hasGeneratedCode ? <button onClick={handleAnalyzeArchitecture} className="bg-indigo-600 text-white px-5 py-2 rounded-xl">Run Live Dual Run Validation</button> 
-                : "Run translation first."}
+              <div className="py-16 text-center text-xs text-slate-400">
+                {isAnalyzing ? <span className="text-cyan-400 animate-pulse">Scanning dbt architecture...</span>
+                  : hasGeneratedCode ? <button onClick={handleAnalyzeArchitecture} className="bg-indigo-600 text-white px-5 py-2 rounded-xl">Run Live Dual Run Validation</button>
+                  : "Run translation first."}
               </div>
             )}
           </div>
@@ -638,7 +699,7 @@ ${dbtYaml}`;
                 </span>
               )}
             </div>
-            
+
             <div className="bg-slate-950 border border-slate-700 rounded-xl p-4 font-mono text-xs text-cyan-300 overflow-x-auto min-h-[200px]">
               {isDagLoading ? (
                 <div className="text-slate-500">Mapping entity relationships...</div>
@@ -676,7 +737,7 @@ ${dbtYaml}`;
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-md w-full flex flex-col gap-4 text-xs">
             <h3 className="font-bold text-white">Engine Configuration</h3>
-            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="API Key" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
+            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Engine API Key" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
             <div className="flex justify-end gap-2">
               <button onClick={() => setShowConfigModal(false)} className="text-slate-400">Cancel</button>
               <button onClick={saveConfig} className="bg-indigo-600 text-white px-4 py-2 rounded">Save</button>
