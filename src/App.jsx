@@ -86,6 +86,17 @@ export default function App() {
     setIsSelfHealedCode(false);
   };
 
+  const handleResetWorkspace = () => {
+    setSourceCode('');
+    setDbtSql('');
+    setDbtYaml('');
+    setDagStatus('pending');
+    setDagData(null);
+    setShowDagModal(false);
+    resetGeneratedStates();
+    showStatus('Workspace reset. Ready for new Oracle PL/SQL input.');
+  };
+
   const handleSourceChange = (e) => {
     setSourceCode(e.target.value);
     setDagStatus('pending');
@@ -473,6 +484,7 @@ ${dbtYaml}`;
 
   const hasGeneratedCode = dbtSql.length > 0;
   const isDriftDetected = analysisResult?.hasDrift;
+  const canReset = Boolean(sourceCode || dbtSql || dbtYaml || dagStatus !== 'pending');
 
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100 flex flex-col font-sans selection:bg-cyan-500">
@@ -529,6 +541,14 @@ ${dbtYaml}`;
                 {isLoading ? 'Synthesising via Neural Engine...' : dagStatus === 'clean' ? '▷ Run dbt Translation' : '🔒 Locked: Analyze DAG First'}
               </button>
             </div>
+
+            <button
+              onClick={handleResetWorkspace}
+              disabled={!canReset || isLoading || isDagLoading}
+              className="bg-slate-800/80 text-slate-300 border border-slate-700 hover:bg-rose-950/60 hover:text-rose-200 hover:border-rose-800 disabled:opacity-40 disabled:pointer-events-none px-4 py-2 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5"
+            >
+              <span>↻ Reset</span>
+            </button>
           </div>
 
           <div className="grid grid-cols-2 gap-4 flex-1">
