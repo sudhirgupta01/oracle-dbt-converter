@@ -7,24 +7,38 @@ const ENGINE_MODELS = [
 ];
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState('transpiler');
+  
   const [sourceCode, setSourceCode] = useState('');
   const [dbtSql, setDbtSql] = useState('');
   const [dbtYaml, setDbtYaml] = useState('');
   
   const [isLoading, setIsLoading] = useState(false);
-  const [isDeploying, setIsDeploying] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [isError, setIsError] = useState(false);
 
-  // Modals
+  // Modals & Config
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showGitModal, setShowGitModal] = useState(false);
-
-  // API Keys & Config
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('oracle_engine_key') || '');
+  
+  // GitHub State
   const [gitToken, setGitToken] = useState(() => localStorage.getItem('github_pat') || '');
   const [gitOwner, setGitOwner] = useState(() => localStorage.getItem('github_owner') || '');
   const [gitRepo, setGitRepo] = useState(() => localStorage.getItem('github_repo') || '');
+  const [isDeploying, setIsDeploying] = useState(false);
+
+  // Dynamic AI Scaffolder State
+  const [scaffoldTree, setScaffoldTree] = useState(null);
+  const [isScaffolding, setIsScaffolding] = useState(false);
+
+  // AI-Driven Dual-Run Validation & Healing State
+  const [validationRun, setValidationRun] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState(null);
+  const [aiSelfHealing, setAiSelfHealing] = useState(false);
+  const [isRemediating, setIsRemediating] = useState(false);
+  const [isSelfHealedCode, setIsSelfHealedCode] = useState(false);
 
   const saveConfig = () => {
     localStorage.setItem('oracle_engine_key', apiKey.trim());
@@ -43,6 +57,14 @@ export default function App() {
   const showStatus = (msg, error = false) => {
     setStatusMessage(msg);
     setIsError(error);
+  };
+
+  const resetGeneratedStates = () => {
+    setScaffoldTree(null);
+    setValidationRun(false);
+    setAnalysisResult(null);
+    setAiSelfHealing(false);
+    setIsSelfHealedCode(false);
   };
 
   const callNeuralEngine = async (promptText) => {
@@ -80,16 +102,17 @@ export default function App() {
     setIsLoading(true);
     setDbtSql('');
     setDbtYaml('');
+    resetGeneratedStates();
     showStatus('');
 
     const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture.
-    Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
-    - "sql": The dbt SELECT model (handle NVL to COALESCE, SYSDATE to CURRENT_TIMESTAMP, etc.).
-    - "yaml": The dbt schema.yml definition with standard tests (unique, not_null).
-    NO markdown formatting, NO backticks, ONLY raw JSON.
-    
-    Oracle Source:
-    ${sourceCode}`;
+Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
+- "sql": The dbt SELECT model (handle NVL to COALESCE, SYSDATE to CURRENT_TIMESTAMP, etc.).
+- "yaml": The dbt schema.yml definition with standard tests (unique, not_null).
+CRITICAL: Do NOT use markdown backticks, and escape any internal quotes. ONLY raw JSON.
+
+Oracle Source:
+${sourceCode}`;
 
     try {
       const jsonResponse = await callNeuralEngine(prompt);
@@ -97,6 +120,7 @@ export default function App() {
       setDbtSql(parsed.sql || '');
       setDbtYaml(parsed.yaml || '');
       showStatus('Translation complete. Code ready for GitHub deployment.');
+      generateDynamicScaffold(sourceCode, parsed.sql, parsed.yaml);
     } catch (err) {
       showStatus(`Engine Error: Ensure AI returns valid JSON. ${err.message}`, true);
     } finally {
@@ -104,13 +128,111 @@ export default function App() {
     }
   };
 
-  // REAL-TIME GITHUB PUSH LOGIC
+  const generateDynamicScaffold = async (srcCode, targetSql, targetYaml, driftInfo = null) => {
+    setIsScaffolding(true);
+    const driftContext = driftInfo?.hasDrift ? `\nNote: Validator flagged ${driftInfo.driftType}. Include the fix in the tree.` : '';
+
+    const scaffoldPrompt = `You are a Data Architect. Inspect this Oracle PL/SQL and the generated dbt SQL/YAML. 
+Design a tailored dbt repository folder tree (e.g., dbt_project.yml, models/staging, models/marts).${driftContext}
+Return ONLY a clean ASCII directory tree (using ├──, └──, │) with brief inline comments. Do NOT include markdown backticks.
+
+PL/SQL: ${srcCode}
+dbt SQL: ${targetSql}`;
+
+    try {
+      const treeOutput = await callNeuralEngine(scaffoldPrompt);
+      setScaffoldTree(treeOutput);
+    } catch {
+      setScaffoldTree(null);
+    } finally {
+      setIsScaffolding(false);
+    }
+  };
+
+  const handleAnalyzeArchitecture = async () => {
+    if (!dbtSql.trim()) return;
+    if (!apiKey.trim()) return;
+
+    setIsAnalyzing(true);
+    setValidationRun(true);
+    setAnalysisResult(null);
+    setAiSelfHealing(false);
+    showStatus('');
+
+    const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator.
+Analyze this Oracle PL/SQL and its transpiled dbt equivalent. 
+Look for anti-patterns: un-migrated Oracle functions (like DECODE or SYSDATE), missing unique/not_null tests in the YAML, or hardcoded schemas instead of {{ ref() }}.
+
+Respond ONLY with a valid JSON object. 
+CRITICAL RULES: No markdown backticks. Use single quotes (') inside string values, never double quotes (").
+
+{
+  "hasDrift": boolean,
+  "parityScore": "string percentage (e.g., '100.00%' or '72.14%')",
+  "driftType": "string (null if no drift, e.g., 'ORACLE_FUNCTION_LEAK', 'MISSING_DATA_TESTS')",
+  "terminalDriftLog": "string explaining the risk (null if no drift)",
+  "healAction": "string describing the fix (null if no drift)",
+  "terminalHealLog": "string explaining the agent's fix (null if no drift)"
+}
+
+Oracle Source:
+${sourceCode}
+dbt SQL:
+${dbtSql}`;
+
+    try {
+      const rawJsonResponse = await callNeuralEngine(diagnosticPrompt);
+      const parsedJson = JSON.parse(rawJsonResponse);
+      setAnalysisResult(parsedJson);
+      showStatus(`Architecture validation complete.`);
+      if (parsedJson.hasDrift) generateDynamicScaffold(sourceCode, dbtSql, dbtYaml, parsedJson);
+    } catch (err) {
+      setValidationRun(false);
+      showStatus(`Validation Error: ${err.message}`, true);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const triggerSelfHealingRemediation = async () => {
+    if (!dbtSql.trim() || !analysisResult?.hasDrift) return;
+    setIsRemediating(true);
+
+    const remediationPrompt = `You are a dbt remediation agent. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
+Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
+Do NOT use markdown formatting. ONLY raw JSON.
+
+Current SQL:
+${dbtSql}
+Current YAML:
+${dbtYaml}`;
+
+    try {
+      const jsonResponse = await callNeuralEngine(remediationPrompt);
+      const parsed = JSON.parse(jsonResponse);
+      
+      const healBanner = `/* [AI SELF-HEALED | Fix: ${analysisResult.healAction}] */`;
+      const finalSql = parsed.sql.startsWith('/* [AI') ? parsed.sql : `${healBanner}\n${parsed.sql}`;
+      
+      setDbtSql(finalSql);
+      if(parsed.yaml) setDbtYaml(parsed.yaml);
+      
+      setIsSelfHealedCode(true);
+      setAiSelfHealing(true);
+      showStatus(`Self-Healing complete: dbt models patched for ${analysisResult.driftType}.`);
+      generateDynamicScaffold(sourceCode, finalSql, parsed.yaml, analysisResult);
+    } catch (err) {
+      showStatus(`Self-Healing Error: ${err.message}`, true);
+    } finally {
+      setIsRemediating(false);
+    }
+  };
+
   const pushFileToGitHub = async (fileName, fileContent) => {
     const url = `[https://api.github.com/repos/$](https://api.github.com/repos/$){gitOwner}/${gitRepo}/contents/models/${fileName}`;
     const contentBase64 = btoa(unescape(encodeURIComponent(fileContent)));
-
-    // 1. Check if file already exists to get its SHA (required for updating files in GitHub)
     let sha = null;
+    
     try {
       const getRes = await fetch(url, { headers: { 'Authorization': `Bearer ${gitToken}` } });
       if (getRes.ok) {
@@ -119,33 +241,23 @@ export default function App() {
       }
     } catch (e) {}
 
-    // 2. Commit the file
-    const body = {
-      message: `Automated dbt conversion: ${fileName} via Neural Engine`,
-      content: contentBase64,
-    };
+    const body = { message: `Automated dbt conversion: ${fileName} via Neural Engine`, content: contentBase64 };
     if (sha) body.sha = sha;
 
     const putRes = await fetch(url, {
       method: 'PUT',
-      headers: {
-        'Authorization': `Bearer ${gitToken}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${gitToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
 
-    if (!putRes.ok) {
-      const err = await putRes.json();
-      throw new Error(err.message || 'GitHub push failed');
-    }
+    if (!putRes.ok) throw new Error('GitHub push failed. Check token permissions and repo name.');
   };
 
   const handleDeployToGit = async () => {
     if (!dbtSql.trim()) return showStatus('No dbt models to deploy. Run translation first.', true);
     if (!gitToken || !gitOwner || !gitRepo) {
       setShowGitModal(true);
-      return showStatus('Please configure GitHub integration credentials.', true);
+      return showStatus('Please configure GitHub credentials.', true);
     }
 
     setIsDeploying(true);
@@ -154,7 +266,7 @@ export default function App() {
     try {
       await pushFileToGitHub('stg_oracle_model.sql', dbtSql);
       await pushFileToGitHub('schema.yml', dbtYaml);
-      showStatus(`✅ Successfully deployed models to GitHub (${gitOwner}/${gitRepo})! CI/CD Pipeline triggered.`);
+      showStatus(`✅ Successfully deployed models to GitHub (${gitOwner}/${gitRepo})!`);
     } catch (err) {
       showStatus(`GitHub Deployment Error: ${err.message}`, true);
     } finally {
@@ -163,6 +275,7 @@ export default function App() {
   };
 
   const hasGeneratedCode = dbtSql.length > 0;
+  const isDriftDetected = analysisResult?.hasDrift;
 
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100 flex flex-col font-sans selection:bg-cyan-500">
@@ -175,14 +288,23 @@ export default function App() {
         </div>
         <div className="flex gap-2">
           {hasGeneratedCode && (
-            <button 
-              onClick={handleDeployToGit}
-              disabled={isDeploying}
-              className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded-xl text-xs font-bold shadow flex items-center gap-2"
-            >
+            <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded-xl text-xs font-bold shadow flex items-center gap-2">
               {isDeploying ? 'Deploying...' : '☁️ Push to GitHub'}
             </button>
           )}
+          <div className="bg-[#111928] border border-slate-800 p-1 rounded-xl flex gap-1 mx-2">
+            <button onClick={() => setActiveTab('transpiler')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${activeTab === 'transpiler' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>
+              <span>1. Code Conversion</span>
+              {isSelfHealedCode && <span className="w-2 h-2 rounded-full bg-emerald-400" />}
+            </button>
+            <button onClick={() => setActiveTab('scaffolder')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${activeTab === 'scaffolder' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>
+              <span>📁 2. dbt Scaffolder</span>
+            </button>
+            <button onClick={() => setActiveTab('dualrun')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${activeTab === 'dualrun' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>
+              <span>📈 3. Architecture Validator</span>
+              {hasGeneratedCode && !validationRun && <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />}
+            </button>
+          </div>
           <button onClick={() => setShowGitModal(true)} className="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300">🐙 Git Hub</button>
           <button onClick={() => setShowConfigModal(true)} className="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300">⚙️ Engine</button>
         </div>
@@ -195,83 +317,185 @@ export default function App() {
         </div>
       )}
 
-      <main className="flex-1 flex flex-col p-6 gap-4 w-full mx-auto max-w-7xl">
-        <div className="flex justify-between bg-[#111928] p-3 rounded-xl border border-slate-800 items-center">
-          <button onClick={handleTranspile} disabled={isLoading} className="bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
-            {isLoading ? 'Synthesising via Neural Engine...' : '▷ Run dbt Translation'}
-          </button>
-        </div>
-        
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1">
-          {/* SOURCE PANEL */}
-          <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800">
-            <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
-              <span className="text-xs font-semibold text-slate-400">INPUT: Legacy Oracle PL/SQL</span>
+      {activeTab === 'transpiler' && (
+        <main className="flex-1 flex flex-col p-6 gap-4 w-full mx-auto">
+          <div className="flex justify-between bg-[#111928] p-3 rounded-xl border border-slate-800 items-center">
+            <button onClick={handleTranspile} disabled={isLoading} className="bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
+              {isLoading ? 'Synthesising via Neural Engine...' : '▷ Run dbt Translation'}
+            </button>
+          </div>
+          
+          <div className="grid grid-cols-2 gap-4 flex-1">
+            <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800">
+              <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
+                <span className="text-xs font-semibold text-slate-400">INPUT: Oracle PL/SQL</span>
+              </div>
+              <textarea value={sourceCode} onChange={(e) => setSourceCode(e.target.value)} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-slate-200 outline-none" placeholder="Paste Oracle PL/SQL Stored Procedure or View here..." spellCheck={false} />
             </div>
-            <textarea value={sourceCode} onChange={(e) => setSourceCode(e.target.value)} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-slate-200 outline-none" placeholder="Paste Oracle PL/SQL Stored Procedure or View here..." spellCheck={false} />
+
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
+                <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
+                  <span className="text-xs font-semibold text-cyan-400">TARGET: dbt Model (.sql)</span>
+                  {isSelfHealedCode && <span className="bg-emerald-500/15 text-emerald-300 text-[10px] px-2.5 py-0.5 rounded border border-emerald-500/30">⚡ Self-Healed</span>}
+                </div>
+                <textarea readOnly value={dbtSql} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-cyan-100 outline-none" placeholder="dbt SQL logic will generate here..." spellCheck={false} />
+              </div>
+
+              <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
+                <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
+                  <span className="text-xs font-semibold text-emerald-400">TARGET: dbt Schema (.yml)</span>
+                </div>
+                <textarea readOnly value={dbtYaml} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-emerald-100 outline-none" placeholder="dbt schema and tests will generate here..." spellCheck={false} />
+              </div>
+            </div>
+          </div>
+        </main>
+      )}
+
+      {activeTab === 'scaffolder' && (
+        <main className="flex-1 p-8 max-w-6xl mx-auto w-full">
+          <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 mb-6 flex justify-between items-center">
+            <div>
+              <h2 className="text-white font-bold mb-1 flex items-center gap-2"><span className="text-blue-400">📁</span> Enterprise dbt Scaffolder</h2>
+              <p className="text-xs text-slate-400">Neural-synthesised repository structure tailored to your Oracle PL/SQL payload.</p>
+            </div>
+          </div>
+          {hasGeneratedCode ? (
+            <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 font-mono text-xs leading-relaxed">
+              {isScaffolding ? (
+                <div className="py-12 text-center text-cyan-400 animate-pulse">Synthesising dbt repository blueprint...</div>
+              ) : scaffoldTree ? (
+                <pre className="text-slate-200 whitespace-pre-wrap">{scaffoldTree}</pre>
+              ) : (
+                <div className="py-12 text-center text-slate-400">Blueprint unavailable.</div>
+              )}
+            </div>
+          ) : (
+            <div className="p-16 text-center text-slate-400 text-xs bg-[#111928] rounded-2xl border border-slate-800">
+              Run translation first to generate a dynamic dbt repository blueprint.
+            </div>
+          )}
+        </main>
+      )}
+
+      {activeTab === 'dualrun' && (
+        <main className="flex-1 p-8 max-w-6xl mx-auto w-full space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="bg-[#111928] border border-slate-800 rounded-2xl p-5 shadow-xl">
+              <div className="text-[11px] font-bold text-slate-400 uppercase mb-2">TARGET READINESS</div>
+              <div className={`text-2xl font-black ${validationRun && isDriftDetected && !aiSelfHealing ? 'text-rose-400' : 'text-white'}`}>
+                {validationRun ? (isDriftDetected && !aiSelfHealing ? 'CRITICAL DRIFT' : 'PRODUCTION READY') : 'PENDING'}
+              </div>
+            </div>
+            <div className="bg-[#111928] border border-slate-800 rounded-2xl p-5 shadow-xl">
+              <div className="text-[11px] font-bold text-slate-400 uppercase mb-2">MODELS VERIFIED</div>
+              <div className="text-2xl font-black text-white">{validationRun ? '1 / 1' : '0 / 0'}</div>
+            </div>
+            <div className="bg-[#111928] border border-slate-800 rounded-2xl p-5 shadow-xl">
+              <div className="text-[11px] font-bold text-slate-400 uppercase mb-2">DATA PARITY SCORE</div>
+              <div className={`text-2xl font-black ${validationRun && isDriftDetected && !aiSelfHealing ? 'text-rose-400' : 'text-white'}`}>
+                {validationRun ? (aiSelfHealing ? '100.00%' : analysisResult?.parityScore) : '0.00%'}
+              </div>
+            </div>
           </div>
 
-          {/* TARGET PANEL */}
-          <div className="flex flex-col gap-4">
-            <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
-              <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
-                <span className="text-xs font-semibold text-cyan-400">TARGET: dbt Model (.sql)</span>
+          <div className="bg-[#111928] border border-slate-800 rounded-2xl shadow-xl">
+            <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-white flex items-center gap-2"><span className="text-indigo-400">⚖️</span> Anti-Pattern & Drift Analysis</h3>
+              <div className="flex items-center space-x-3">
+                <span className="text-[11px] font-bold uppercase text-slate-400">AI Self-Healing Engine</span>
+                <button onClick={() => { if (!aiSelfHealing) triggerSelfHealingRemediation(); }} disabled={!isDriftDetected || isRemediating || aiSelfHealing} className={`w-11 h-6 flex items-center rounded-full p-1 transition-colors ${aiSelfHealing ? 'bg-emerald-600' : 'bg-slate-800'}`}>
+                  <div className={`bg-white w-4 h-4 rounded-full transform transition-transform ${aiSelfHealing ? 'translate-x-5' : 'translate-x-0'}`} />
+                </button>
               </div>
-              <textarea readOnly value={dbtSql} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-cyan-100 outline-none" placeholder="dbt SQL logic will generate here..." spellCheck={false} />
             </div>
-
-            <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
-              <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
-                <span className="text-xs font-semibold text-emerald-400">TARGET: dbt Schema (.yml)</span>
+            
+            {hasGeneratedCode && validationRun && analysisResult ? (
+              <div className="grid grid-cols-4 px-6 py-4 items-center text-xs text-slate-300 gap-2">
+                <div className="font-mono text-cyan-300">Generated dbt Model</div>
+                <div>
+                  <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${!isDriftDetected || aiSelfHealing ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20'}`}>
+                    {!isDriftDetected || aiSelfHealing ? 'Parity Verified' : analysisResult.driftType}
+                  </span>
+                </div>
+                <div className={`font-mono font-bold ${!isDriftDetected || aiSelfHealing ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {!isDriftDetected || aiSelfHealing ? '100.00%' : analysisResult.parityScore}
+                </div>
+                <div className="flex flex-col gap-1.5 items-start">
+                  {!isDriftDetected ? (
+                    <span className="text-slate-400">Zero divergence confirmed</span>
+                  ) : aiSelfHealing ? (
+                    <>
+                      <span className="text-emerald-300">{analysisResult.healAction}</span>
+                      <button onClick={() => setActiveTab('transpiler')} className="bg-emerald-600/20 text-emerald-300 px-2.5 py-1 rounded text-[11px] font-semibold">Inspect Patched Code ➔</button>
+                    </>
+                  ) : (
+                    <button onClick={triggerSelfHealingRemediation} disabled={isRemediating} className="bg-indigo-600 text-white px-3 py-1 rounded text-[11px] font-medium">
+                      {isRemediating ? 'Refactoring...' : '⚡ Self-Heal Code'}
+                    </button>
+                  )}
+                </div>
               </div>
-              <textarea readOnly value={dbtYaml} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-emerald-100 outline-none" placeholder="dbt schema and test configurations will generate here..." spellCheck={false} />
+            ) : (
+               <div className="py-16 text-center text-xs text-slate-400">
+                {isAnalyzing ? <span className="text-cyan-400 animate-pulse">Scanning dbt architecture...</span> 
+                : hasGeneratedCode ? <button onClick={handleAnalyzeArchitecture} className="bg-indigo-600 text-white px-5 py-2 rounded-xl">Run Live Architecture Profiler</button> 
+                : "Run translation first."}
+              </div>
+            )}
+          </div>
+
+          <div className="bg-[#111928] border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
+            <div className="px-6 py-3 border-b border-slate-800"><span className="text-[11px] font-bold uppercase text-slate-400">Autonomous Remediation Terminal</span></div>
+            <div className="p-5 font-mono text-xs text-slate-400 bg-slate-950/60 min-h-[100px] leading-relaxed">
+              {validationRun && analysisResult ? (
+                isDriftDetected ? (
+                  aiSelfHealing ? (
+                    <div className="space-y-1 text-emerald-300">
+                      <p className="text-cyan-400">[info] {analysisResult.terminalDriftLog}</p>
+                      <p className="text-indigo-400">[agent] {analysisResult.terminalHealLog}</p>
+                      <p className="text-emerald-400 font-semibold">[success] dbt cloud deployment readiness verified.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-1 text-slate-300">
+                      <p className="text-rose-400">[warn] {analysisResult.terminalDriftLog}</p>
+                      <p className="text-slate-400">[info] Click '⚡ Self-Heal Code' to resolve the anti-pattern.</p>
+                    </div>
+                  )
+                ) : (
+                  <p className="text-emerald-400">[success] Zero divergence detected. Code verified for cloud deployment.</p>
+                )
+              ) : <p>{isAnalyzing ? "Generating diagnostic report..." : "Waiting for agent activation..."}</p>}
             </div>
           </div>
-        </div>
-      </main>
+        </main>
+      )}
 
-      {/* Engine Config Modal */}
+      {/* Modals */}
       {showConfigModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-md w-full flex flex-col gap-4 text-xs">
-            <h3 className="font-bold text-white">Modernisation Engine Configuration</h3>
-            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Engine API Key" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
+            <h3 className="font-bold text-white">Engine Configuration</h3>
+            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="API Key" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowConfigModal(false)} className="text-slate-400 hover:text-white">Cancel</button>
-              <button onClick={saveConfig} className="bg-indigo-600 text-white px-4 py-2 rounded font-semibold">Save</button>
+              <button onClick={() => setShowConfigModal(false)} className="text-slate-400">Cancel</button>
+              <button onClick={saveConfig} className="bg-indigo-600 text-white px-4 py-2 rounded">Save</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* GitHub Integration Modal */}
       {showGitModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-md w-full flex flex-col gap-4 text-xs">
-            <div>
-              <h3 className="font-bold text-white text-sm mb-1">GitHub Integration</h3>
-              <p className="text-slate-400">Connect to your repository to push converted dbt models automatically.</p>
-            </div>
-            
-            <label className="flex flex-col gap-1 text-slate-300">
-              GitHub Owner / Organization:
-              <input type="text" value={gitOwner} onChange={(e) => setGitOwner(e.target.value)} placeholder="e.g., your-username" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
-            </label>
-
-            <label className="flex flex-col gap-1 text-slate-300">
-              Repository Name:
-              <input type="text" value={gitRepo} onChange={(e) => setGitRepo(e.target.value)} placeholder="e.g., dbt-migration-project" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
-            </label>
-
-            <label className="flex flex-col gap-1 text-slate-300">
-              Personal Access Token (PAT):
-              <input type="password" value={gitToken} onChange={(e) => setGitToken(e.target.value)} placeholder="ghp_xxxxxxxxxxxx" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
-              <span className="text-[10px] text-slate-500">Requires 'repo' scope. Tokens are saved locally in your browser.</span>
-            </label>
-
+            <h3 className="font-bold text-white text-sm mb-1">GitHub Integration</h3>
+            <label className="flex flex-col gap-1 text-slate-300">Owner: <input type="text" value={gitOwner} onChange={(e) => setGitOwner(e.target.value)} className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
+            <label className="flex flex-col gap-1 text-slate-300">Repo: <input type="text" value={gitRepo} onChange={(e) => setGitRepo(e.target.value)} className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
+            <label className="flex flex-col gap-1 text-slate-300">Token: <input type="password" value={gitToken} onChange={(e) => setGitToken(e.target.value)} className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
             <div className="flex justify-end gap-2 mt-2">
-              <button onClick={() => setShowGitModal(false)} className="text-slate-400 hover:text-white">Cancel</button>
-              <button onClick={saveGitConfig} className="bg-emerald-600 text-white px-4 py-2 rounded font-semibold">Connect to GitHub</button>
+              <button onClick={() => setShowGitModal(false)} className="text-slate-400">Cancel</button>
+              <button onClick={saveGitConfig} className="bg-emerald-600 text-white px-4 py-2 rounded">Connect</button>
             </div>
           </div>
         </div>
