@@ -6,20 +6,31 @@ const ENGINE_MODELS = [
   'gemini-3.1-flash-lite'
 ];
 
+const DB_TARGETS = [
+  { id: 'snowflake', label: 'Snowflake' },
+  { id: 'bigquery', label: 'Google BigQuery' },
+  { id: 'databricks', label: 'Databricks SQL' },
+  { id: 'redshift', label: 'Amazon Redshift' }
+];
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('transpiler');
   
   const [sourceCode, setSourceCode] = useState('');
+  const [targetDb, setTargetDb] = useState('snowflake');
   const [dbtSql, setDbtSql] = useState('');
   const [dbtYaml, setDbtYaml] = useState('');
   
   const [isLoading, setIsLoading] = useState(false);
+  const [isDagLoading, setIsDagLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [isError, setIsError] = useState(false);
 
   // Modals & Config
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showGitModal, setShowGitModal] = useState(false);
+  const [showDagModal, setShowDagModal] = useState(false);
+  const [dagContent, setDagContent] = useState('');
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('oracle_engine_key') || '');
   
   // GitHub State
@@ -51,7 +62,7 @@ export default function App() {
     localStorage.setItem('github_owner', gitOwner.trim());
     localStorage.setItem('github_repo', gitRepo.trim());
     setShowGitModal(false);
-    showStatus('GitHub configuration saved. Ready for deployment.');
+    showStatus('GitHub configuration saved.');
   };
 
   const showStatus = (msg, error = false) => {
@@ -105,9 +116,11 @@ export default function App() {
     resetGeneratedStates();
     showStatus('');
 
-    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture.
+    const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
+
+    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture optimized for ${targetLabel}.
 Respond ONLY with a valid JSON object containing exactly two keys: "sql" and "yaml".
-- "sql": The dbt SELECT model (handle NVL to COALESCE, SYSDATE to CURRENT_TIMESTAMP, etc.).
+- "sql": The dbt SELECT model (use ${targetLabel} specific syntax if needed, map NVL to COALESCE, etc.).
 - "yaml": The dbt schema.yml definition with standard tests (unique, not_null).
 CRITICAL: Do NOT use markdown backticks, and escape any internal quotes. ONLY raw JSON.
 
@@ -119,12 +132,34 @@ ${sourceCode}`;
       const parsed = JSON.parse(jsonResponse);
       setDbtSql(parsed.sql || '');
       setDbtYaml(parsed.yaml || '');
-      showStatus('Translation complete. Code ready for GitHub deployment.');
+      showStatus(`Translation complete for ${targetLabel}. Go to Dual Run Validation to verify and deploy.`);
       generateDynamicScaffold(sourceCode, parsed.sql, parsed.yaml);
     } catch (err) {
       showStatus(`Engine Error: Ensure AI returns valid JSON. ${err.message}`, true);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleAnalyzeDAG = async () => {
+    if (!sourceCode.trim()) return showStatus('Please paste Oracle code first to analyze lineage.', true);
+    if (!apiKey.trim()) return showStatus('Please configure your Engine API Key.', true);
+
+    setIsDagLoading(true);
+    setShowDagModal(true);
+    setDagContent('Analyzing PL/SQL dependencies and generating dbt lineage DAG...');
+
+    const prompt = `Analyze this Oracle PL/SQL and generate an ASCII art Directed Acyclic Graph (DAG) showing how the data flows from source tables into the final dbt model. 
+Return ONLY the raw ASCII art, no markdown backticks.
+Code: ${sourceCode}`;
+
+    try {
+      const asciiDag = await callNeuralEngine(prompt);
+      setDagContent(asciiDag);
+    } catch (err) {
+      setDagContent(`Error generating DAG: ${err.message}`);
+    } finally {
+      setIsDagLoading(false);
     }
   };
 
@@ -254,10 +289,10 @@ ${dbtYaml}`;
   };
 
   const handleDeployToGit = async () => {
-    if (!dbtSql.trim()) return showStatus('No dbt models to deploy. Run translation first.', true);
+    if (!dbtSql.trim()) return showStatus('No dbt models to deploy.', true);
     if (!gitToken || !gitOwner || !gitRepo) {
       setShowGitModal(true);
-      return showStatus('Please configure GitHub credentials.', true);
+      return showStatus('Please configure GitHub credentials first.', true);
     }
 
     setIsDeploying(true);
@@ -286,12 +321,7 @@ ${dbtYaml}`;
           </h1>
           <p className="text-[11px] text-slate-400">PL/SQL ➔ Cloud-Native dbt Models</p>
         </div>
-        <div className="flex gap-2">
-          {hasGeneratedCode && (
-            <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded-xl text-xs font-bold shadow flex items-center gap-2">
-              {isDeploying ? 'Deploying...' : '☁️ Push to GitHub'}
-            </button>
-          )}
+        <div className="flex gap-2 items-center">
           <div className="bg-[#111928] border border-slate-800 p-1 rounded-xl flex gap-1 mx-2">
             <button onClick={() => setActiveTab('transpiler')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${activeTab === 'transpiler' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>
               <span>1. Code Conversion</span>
@@ -301,7 +331,7 @@ ${dbtYaml}`;
               <span>📁 2. dbt Scaffolder</span>
             </button>
             <button onClick={() => setActiveTab('dualrun')} className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${activeTab === 'dualrun' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>
-              <span>📈 3. Architecture Validator</span>
+              <span>🛡️ 3. Dual Run Validation</span>
               {hasGeneratedCode && !validationRun && <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />}
             </button>
           </div>
@@ -320,9 +350,14 @@ ${dbtYaml}`;
       {activeTab === 'transpiler' && (
         <main className="flex-1 flex flex-col p-6 gap-4 w-full mx-auto">
           <div className="flex justify-between bg-[#111928] p-3 rounded-xl border border-slate-800 items-center">
-            <button onClick={handleTranspile} disabled={isLoading} className="bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
-              {isLoading ? 'Synthesising via Neural Engine...' : '▷ Run dbt Translation'}
-            </button>
+            <div className="flex gap-2">
+              <button onClick={handleTranspile} disabled={isLoading} className="bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
+                {isLoading ? 'Synthesising via Neural Engine...' : '▷ Run dbt Translation'}
+              </button>
+              <button onClick={handleAnalyzeDAG} disabled={isDagLoading} className="bg-slate-800 text-cyan-400 border border-cyan-900/50 hover:bg-slate-700 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md">
+                {isDagLoading ? 'Analyzing Lineage...' : '🕸️ Analyze DAG'}
+              </button>
+            </div>
           </div>
           
           <div className="grid grid-cols-2 gap-4 flex-1">
@@ -336,7 +371,14 @@ ${dbtYaml}`;
             <div className="flex flex-col gap-4">
               <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
                 <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
-                  <span className="text-xs font-semibold text-cyan-400">TARGET: dbt Model (.sql)</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-cyan-400">TARGET:</span>
+                    <select value={targetDb} onChange={(e) => setTargetDb(e.target.value)} className="bg-slate-900 text-cyan-300 text-xs font-bold px-2 py-1 rounded border border-slate-700 outline-none">
+                      {DB_TARGETS.map(db => (
+                        <option key={db.id} value={db.id}>{db.label}</option>
+                      ))}
+                    </select>
+                  </div>
                   {isSelfHealedCode && <span className="bg-emerald-500/15 text-emerald-300 text-[10px] px-2.5 py-0.5 rounded border border-emerald-500/30">⚡ Self-Healed</span>}
                 </div>
                 <textarea readOnly value={dbtSql} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-cyan-100 outline-none" placeholder="dbt SQL logic will generate here..." spellCheck={false} />
@@ -440,7 +482,7 @@ ${dbtYaml}`;
             ) : (
                <div className="py-16 text-center text-xs text-slate-400">
                 {isAnalyzing ? <span className="text-cyan-400 animate-pulse">Scanning dbt architecture...</span> 
-                : hasGeneratedCode ? <button onClick={handleAnalyzeArchitecture} className="bg-indigo-600 text-white px-5 py-2 rounded-xl">Run Live Architecture Profiler</button> 
+                : hasGeneratedCode ? <button onClick={handleAnalyzeArchitecture} className="bg-indigo-600 text-white px-5 py-2 rounded-xl">Run Live Dual Run Validation</button> 
                 : "Run translation first."}
               </div>
             )}
@@ -455,7 +497,12 @@ ${dbtYaml}`;
                     <div className="space-y-1 text-emerald-300">
                       <p className="text-cyan-400">[info] {analysisResult.terminalDriftLog}</p>
                       <p className="text-indigo-400">[agent] {analysisResult.terminalHealLog}</p>
-                      <p className="text-emerald-400 font-semibold">[success] dbt cloud deployment readiness verified.</p>
+                      <div className="flex items-center justify-between mt-2 pt-2 border-t border-emerald-900/30">
+                        <p className="text-emerald-400 font-semibold">[success] dbt cloud deployment readiness verified.</p>
+                        <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded text-xs font-bold shadow">
+                          {isDeploying ? 'Deploying to Git...' : '☁️ Push Validated Code to GitHub'}
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <div className="space-y-1 text-slate-300">
@@ -464,12 +511,34 @@ ${dbtYaml}`;
                     </div>
                   )
                 ) : (
-                  <p className="text-emerald-400">[success] Zero divergence detected. Code verified for cloud deployment.</p>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <p className="text-emerald-400 font-semibold">[success] Zero divergence detected. Code verified for cloud deployment.</p>
+                      <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded text-xs font-bold shadow">
+                        {isDeploying ? 'Deploying to Git...' : '☁️ Push Validated Code to GitHub'}
+                      </button>
+                    </div>
+                  </div>
                 )
               ) : <p>{isAnalyzing ? "Generating diagnostic report..." : "Waiting for agent activation..."}</p>}
             </div>
           </div>
         </main>
+      )}
+
+      {/* DAG Modal */}
+      {showDagModal && (
+        <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
+          <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-3xl w-full flex flex-col gap-4">
+            <h3 className="font-bold text-white text-sm">Lineage DAG Explorer</h3>
+            <div className="bg-slate-950 border border-slate-700 rounded-xl p-4 font-mono text-[10px] text-cyan-300 overflow-x-auto min-h-[200px]">
+              <pre>{dagContent}</pre>
+            </div>
+            <div className="flex justify-end">
+              <button onClick={() => setShowDagModal(false)} className="bg-indigo-600 text-white px-4 py-2 rounded text-xs">Close</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Modals */}
