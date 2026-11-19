@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: stg_regional_sales_summary
+    description: "Regional sales summary aggregated by store and region."
+    columns:
+      - name: store_id
+        description: "Unique identifier for the store."
+        tests:
+          - unique
+          - not_null
+      - name: region
+        description: "Uppercase name of the sales region."
+        tests:
+          - not_null
+      - name: gross_revenue
+        description: "Total gross revenue for the store."
+        tests:
+          - not_null
+      - name: unique_customers
+        description: "Count of unique customers who placed orders."
+        tests:
+          - not_null
+      - name: report_date
+        description: "Date the report was generated."
+        tests:
+          - not_null
