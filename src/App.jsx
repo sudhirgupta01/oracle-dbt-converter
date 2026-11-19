@@ -23,6 +23,7 @@ export default function App() {
   const [targetDb, setTargetDb] = useState('snowflake');
   const [dbtSql, setDbtSql] = useState('');
   const [dbtYaml, setDbtYaml] = useState('');
+  const [dbtModelName, setDbtModelName] = useState('stg_oracle_model'); // Dynamic Filename State
 
   // UI & Loading States
   const [isLoading, setIsLoading] = useState(false);
@@ -90,6 +91,7 @@ export default function App() {
     setSourceCode('');
     setDbtSql('');
     setDbtYaml('');
+    setDbtModelName('stg_oracle_model');
     setDagStatus('pending');
     setDagData(null);
     setShowDagModal(false);
@@ -117,15 +119,17 @@ export default function App() {
     return JSON.parse(cleanStr);
   };
 
-  const executeModelRequest = async (modelName, promptText, expectJson, cleanKey) => {
+  // Tiered Temperature Control Engine
+  const executeModelRequest = async (modelName, promptText, expectJson, cleanKey, temperature = 0.1) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 25000);
     const payload = {
-      contents: [{ parts: [{ text: promptText }] }]
+      contents: [{ parts: [{ text: promptText }] }],
+      generationConfig: {
+        temperature: temperature,
+        ...(expectJson ? { responseMimeType: 'application/json' } : {})
+      }
     };
-    if (expectJson) {
-      payload.generationConfig = { responseMimeType: 'application/json' };
-    }
 
     try {
       const response = await fetch(
@@ -153,24 +157,22 @@ export default function App() {
     }
   };
 
-  const callNeuralEngine = async (promptText, expectJson = false) => {
+  const callNeuralEngine = async (promptText, expectJson = false, temperature = 0.1) => {
     const cleanKey = apiKey.trim();
     let lastError = null;
 
-    // 1. Try primary current endpoints
     for (const modelName of ENGINE_MODELS) {
       try {
-        const text = await executeModelRequest(modelName, promptText, expectJson, cleanKey);
+        const text = await executeModelRequest(modelName, promptText, expectJson, cleanKey, temperature);
         if (text) return text;
       } catch (err) {
         lastError = err;
         if (err.status === 403 || (err.status === 400 && /api[_ ]key/i.test(err.message))) {
           throw new Error(`Authentication failed (${err.message}). Verify your Engine API Key.`);
         }
-        // If 400 was due to responseMimeType on a specific model, retry plain text immediately
         if (err.status === 400 && expectJson) {
           try {
-            const fallbackText = await executeModelRequest(modelName, promptText, false, cleanKey);
+            const fallbackText = await executeModelRequest(modelName, promptText, false, cleanKey, temperature);
             if (fallbackText) return fallbackText;
           } catch (retryErr) {
             lastError = retryErr;
@@ -179,7 +181,6 @@ export default function App() {
       }
     }
 
-    // 2. Auto-discover active non-deprecated models if primary endpoints fail
     try {
       const listRes = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(cleanKey)}`
@@ -200,7 +201,7 @@ export default function App() {
         for (const candidate of candidates) {
           try {
             const discoveredId = candidate.name.replace(/^models\//, '');
-            const text = await executeModelRequest(discoveredId, promptText, expectJson, cleanKey);
+            const text = await executeModelRequest(discoveredId, promptText, expectJson, cleanKey, temperature);
             if (text) return text;
           } catch (innerErr) {
             lastError = innerErr;
@@ -214,7 +215,7 @@ export default function App() {
     throw lastError || new Error('Neural Engine failed to respond.');
   };
 
-  // 1. DAG Analyzer (Human-in-the-Loop Gatekeeper)
+  // 1. DAG Analyzer (Temp: 0.0 - Strict Logic)
   const handleAnalyzeDAG = async () => {
     if (!sourceCode.trim()) return showStatus('Please paste Oracle code first to analyze lineage.', true);
     if (!apiKey.trim()) return showStatus('Please configure your Engine API Key.', true);
@@ -238,7 +239,7 @@ Oracle Source:
 ${sourceCode}`;
 
     try {
-      const rawResponse = await callNeuralEngine(prompt, true);
+      const rawResponse = await callNeuralEngine(prompt, true, 0.0);
       const parsed = safeJsonParse(rawResponse);
 
       if (parsed.asciiDag) parsed.asciiDag = formatMultiline(parsed.asciiDag);
@@ -264,7 +265,7 @@ ${sourceCode}`;
     }
   };
 
-  // 2. Code Conversion
+  // 2. Code Conversion (Temp: 0.1 - Standard Deterministic)
   const handleTranspile = async () => {
     if (dagStatus !== 'clean') {
       return showStatus('Pipeline Blocked: Please Analyze DAG and resolve architecture risks first.', true);
@@ -283,6 +284,7 @@ Ensure the SQL dialect used matches ${targetLabel} conventions.
 
 Return a JSON object with this exact schema:
 {
+  "modelName": "string (snake_case dbt model name derived from Oracle source, e.g., 'stg_customers')",
   "sql": "string (the dbt SELECT model tailored for ${targetLabel})",
   "yaml": "string (the dbt schema.yml definition with standard tests like unique and not_null)"
 }
@@ -291,14 +293,16 @@ Oracle Source:
 ${sourceCode}`;
 
     try {
-      const rawResponse = await callNeuralEngine(prompt, true);
+      const rawResponse = await callNeuralEngine(prompt, true, 0.1);
       const parsed = safeJsonParse(rawResponse);
 
       const cleanSql = formatMultiline(parsed.sql || '');
       const cleanYaml = formatMultiline(parsed.yaml || '');
-
+      
+      setDbtModelName(parsed.modelName || 'stg_oracle_model');
       setDbtSql(cleanSql);
       setDbtYaml(cleanYaml);
+      
       showStatus(`Translation complete for ${targetLabel}. Go to Dual Run Validation to verify and deploy.`);
       generateDynamicScaffold(sourceCode, cleanSql, cleanYaml);
     } catch (err) {
@@ -308,7 +312,7 @@ ${sourceCode}`;
     }
   };
 
-  // 3. Dynamic Scaffolder
+  // 3. Dynamic Scaffolder (Temp: 0.1)
   const generateDynamicScaffold = async (srcCode, targetSql, targetYaml, driftInfo = null) => {
     setIsScaffolding(true);
     const driftContext = driftInfo?.hasDrift ? `\nNote: Validator flagged ${driftInfo.driftType}. Include the fix in the tree.` : '';
@@ -321,7 +325,7 @@ PL/SQL: ${srcCode}
 dbt SQL: ${targetSql}`;
 
     try {
-      let rawTree = await callNeuralEngine(scaffoldPrompt, false);
+      let rawTree = await callNeuralEngine(scaffoldPrompt, false, 0.1);
       rawTree = rawTree.replace(/^```[a-zA-Z]*\n?/gm, '').replace(/```$/gm, '').trim();
       setScaffoldTree(rawTree);
     } catch {
@@ -331,7 +335,7 @@ dbt SQL: ${targetSql}`;
     }
   };
 
-  // 4. Dual Run Validation
+  // 4. Dual Run Validation (Temp: 0.0 - Strict Scoring)
   const handleAnalyzeArchitecture = async () => {
     if (!dbtSql.trim() || !apiKey.trim()) return;
 
@@ -362,7 +366,7 @@ dbt SQL:
 ${dbtSql}`;
 
     try {
-      const rawResponse = await callNeuralEngine(diagnosticPrompt, true);
+      const rawResponse = await callNeuralEngine(diagnosticPrompt, true, 0.0);
       const parsedJson = safeJsonParse(rawResponse);
 
       Object.keys(parsedJson).forEach(key => {
@@ -382,7 +386,7 @@ ${dbtSql}`;
     }
   };
 
-  // 5. Self Healing
+  // 5. Self Healing (Temp: 0.15 - Slight Flexibility for Refactoring)
   const triggerSelfHealingRemediation = async () => {
     if (!dbtSql.trim() || !analysisResult?.hasDrift) return;
     setIsRemediating(true);
@@ -403,7 +407,7 @@ Current YAML:
 ${dbtYaml}`;
 
     try {
-      const rawResponse = await callNeuralEngine(remediationPrompt, true);
+      const rawResponse = await callNeuralEngine(remediationPrompt, true, 0.15);
       const parsed = safeJsonParse(rawResponse);
 
       const cleanSql = formatMultiline(parsed.sql || '');
@@ -426,7 +430,7 @@ ${dbtYaml}`;
     }
   };
 
-  // 6. GitHub Deploy
+  // 6. GitHub Deploy (Dynamic Filenames)
   const encodeBase64 = (str) => {
     const bytes = new TextEncoder().encode(str);
     let binary = '';
@@ -471,10 +475,13 @@ ${dbtYaml}`;
     setIsDeploying(true);
     showStatus('Initiating commit to GitHub repository...');
 
+    // Extract a clean, safe filename from the dynamic model name state
+    const safeName = (dbtModelName || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase();
+
     try {
-      await pushFileToGitHub('stg_oracle_model.sql', dbtSql);
-      await pushFileToGitHub('schema.yml', dbtYaml);
-      showStatus(`✅ Successfully deployed models to GitHub (${gitOwner}/${gitRepo})!`);
+      await pushFileToGitHub(`${safeName}.sql`, dbtSql);
+      await pushFileToGitHub(`schema_${safeName}.yml`, dbtYaml);
+      showStatus(`✅ Successfully deployed models to GitHub (${gitOwner}/${gitRepo}/models/)!`);
     } catch (err) {
       showStatus(`GitHub Deployment Error: ${err.message}`, true);
     } finally {
