@@ -1,0 +1,39 @@
+version: 2
+
+models:
+  - name: mart_customer_risk
+    description: "Customer risk mart tracking aggregated quarterly transaction volumes, credit risk tiers, and latest interaction channels."
+    columns:
+      - name: cust_id
+        description: "Unique surrogate/business identifier for the customer."
+        tests:
+          - not_null
+      - name: reporting_qtr_start
+        description: "Start date of the evaluated reporting quarter."
+        tests:
+          - not_null
+      - name: email_domain
+        description: "Domain extracted from the customer email address."
+      - name: effective_score
+        description: "Bureau credit score or default fallback value of 550."
+        tests:
+          - not_null
+      - name: qtr_volume_usd
+        description: "Sum of quarterly transaction amounts converted to USD."
+        tests:
+          - not_null
+      - name: latest_channel
+        description: "Channel code corresponding to the most recent transaction in the quarter."
+      - name: risk_tier
+        description: "Derived risk tier categorization: HIGH_RISK, MEDIUM_RISK, or LOW_RISK."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['HIGH_RISK', 'MEDIUM_RISK', 'LOW_RISK']
+      - name: updated_at
+        description: "Timestamp when the mart record was created or refreshed."
+        tests:
+          - not_null
+    tests:
+      - unique:
+          column_name: "(cust_id || '-' || reporting_qtr_start)"
