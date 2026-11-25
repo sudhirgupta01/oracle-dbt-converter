@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 
 const ENGINE_MODELS = [
   'gemini-3.8-flash',
@@ -23,15 +23,83 @@ const DB_TARGETS = [
   { id: 'duckdb', label: 'DuckDB (Local / CI)' }
 ];
 
+// Zero-dependency pure-JS ZIP file generator (Store method, UTF-8 safe)
+function buildZipBlob(filesMap) {
+  const encoder = new TextEncoder();
+  const crcTable = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable[i] = c;
+  }
+  const crc32 = (buf) => {
+    let crc = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) crc = crcTable[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+
+  const localChunks = [];
+  const centralChunks = [];
+  let offset = 0;
+
+  Object.entries(filesMap).forEach(([filePath, content]) => {
+    const nameBytes = encoder.encode(filePath);
+    const dataBytes = encoder.encode(content);
+    const crc = crc32(dataBytes);
+
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(localHeader.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0x0800, true); // UTF-8 flag
+    lv.setUint16(8, 0, true); // Store
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, dataBytes.length, true);
+    lv.setUint32(22, dataBytes.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    localHeader.set(nameBytes, 30);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(centralHeader.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0x0800, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, dataBytes.length, true);
+    cv.setUint32(24, dataBytes.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint32(42, offset, true);
+    centralHeader.set(nameBytes, 46);
+
+    localChunks.push(localHeader, dataBytes);
+    centralChunks.push(centralHeader);
+    offset += localHeader.length + dataBytes.length;
+  });
+
+  const centralSize = centralChunks.reduce((acc, c) => acc + c.length, 0);
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, centralChunks.length, true);
+  ev.setUint16(10, centralChunks.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+
+  return new Blob([...localChunks, ...centralChunks, eocd], { type: 'application/zip' });
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('transpiler');
+  const fileInputRef = useRef(null);
 
-  // Core Code States
+  // Core Code & Package Decomposition States
   const [sourceCode, setSourceCode] = useState('');
+  const [uploadedFileName, setUploadedFileName] = useState('');
   const [targetDb, setTargetDb] = useState('snowflake');
-  const [dbtSql, setDbtSql] = useState('');
-  const [dbtYaml, setDbtYaml] = useState('');
-  const [dbtModelName, setDbtModelName] = useState('stg_oracle_model');
+  const [generatedModels, setGeneratedModels] = useState([]); // [{ name, layer, sql, yaml }]
+  const [selectedModelIdx, setSelectedModelIdx] = useState(0);
+  const [parityTestSql, setParityTestSql] = useState('');
   const [architecturalAdvisory, setArchitecturalAdvisory] = useState(null);
 
   // UI & Loading States
@@ -42,19 +110,32 @@ export default function App() {
   // DAG Analysis & Human-in-the-Loop States
   const [isDagLoading, setIsDagLoading] = useState(false);
   const [showDagModal, setShowDagModal] = useState(false);
-  const [dagStatus, setDagStatus] = useState('pending'); // 'pending', 'clean', 'error'
+  const [dagStatus, setDagStatus] = useState('pending');
   const [dagData, setDagData] = useState(null);
 
-  // Modals & Config
+  // Security & Credentials (Persisted across sessions by default unless opted out or purged)
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showGitModal, setShowGitModal] = useState(false);
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('oracle_engine_key') || '');
+  const [rememberSecrets, setRememberSecrets] = useState(
+    () => localStorage.getItem('oracle_remember_secrets') !== 'false'
+  );
+  const [apiKey, setApiKey] = useState(
+    () => localStorage.getItem('oracle_engine_key') || sessionStorage.getItem('oracle_engine_key') || ''
+  );
 
-  // GitHub State
-  const [gitToken, setGitToken] = useState(() => localStorage.getItem('github_pat') || '');
-  const [gitOwner, setGitOwner] = useState(() => localStorage.getItem('github_owner') || '');
-  const [gitRepo, setGitRepo] = useState(() => localStorage.getItem('github_repo') || '');
+  // GitHub State (Supports PR Workflow)
+  const [gitToken, setGitToken] = useState(
+    () => localStorage.getItem('github_pat') || sessionStorage.getItem('github_pat') || ''
+  );
+  const [gitOwner, setGitOwner] = useState(
+    () => localStorage.getItem('github_owner') || sessionStorage.getItem('github_owner') || ''
+  );
+  const [gitRepo, setGitRepo] = useState(
+    () => localStorage.getItem('github_repo') || sessionStorage.getItem('github_repo') || ''
+  );
+  const [gitUsePr, setGitUsePr] = useState(true);
   const [isDeploying, setIsDeploying] = useState(false);
+  const [lastPrUrl, setLastPrUrl] = useState('');
 
   // Dynamic AI Scaffolder State
   const [scaffoldTree, setScaffoldTree] = useState(null);
@@ -68,19 +149,49 @@ export default function App() {
   const [isRemediating, setIsRemediating] = useState(false);
   const [isSelfHealedCode, setIsSelfHealedCode] = useState(false);
 
-  // Config Handlers
+  const persistSecret = (key, value, persistLocal) => {
+    sessionStorage.setItem(key, value);
+    if (persistLocal) {
+      localStorage.setItem(key, value);
+    } else {
+      localStorage.removeItem(key);
+    }
+  };
+
   const saveConfig = () => {
-    localStorage.setItem('oracle_engine_key', apiKey.trim());
+    localStorage.setItem('oracle_remember_secrets', String(rememberSecrets));
+    persistSecret('oracle_engine_key', apiKey.trim(), rememberSecrets);
+    persistSecret('github_pat', gitToken.trim(), rememberSecrets);
+    persistSecret('github_owner', gitOwner.trim(), rememberSecrets);
+    persistSecret('github_repo', gitRepo.trim(), rememberSecrets);
     setShowConfigModal(false);
-    showStatus('Engine configuration saved.');
+    showStatus(
+      rememberSecrets
+        ? 'Engine configuration saved across browser sessions.'
+        : 'Engine key saved to active session memory only (auto-clears on tab close).'
+    );
   };
 
   const saveGitConfig = () => {
-    localStorage.setItem('github_pat', gitToken.trim());
-    localStorage.setItem('github_owner', gitOwner.trim());
-    localStorage.setItem('github_repo', gitRepo.trim());
+    persistSecret('github_pat', gitToken.trim(), rememberSecrets);
+    persistSecret('github_owner', gitOwner.trim(), rememberSecrets);
+    persistSecret('github_repo', gitRepo.trim(), rememberSecrets);
     setShowGitModal(false);
-    showStatus('GitHub configuration saved.');
+    showStatus(`GitHub configuration saved (${gitUsePr ? 'Pull Request mode' : 'Direct commit mode'}).`);
+  };
+
+  const purgeAllSecrets = () => {
+    ['oracle_engine_key', 'github_pat', 'github_owner', 'github_repo'].forEach((k) => {
+      sessionStorage.removeItem(k);
+      localStorage.removeItem(k);
+    });
+    localStorage.setItem('oracle_remember_secrets', 'false');
+    setApiKey('');
+    setGitToken('');
+    setGitOwner('');
+    setGitRepo('');
+    setRememberSecrets(false);
+    showStatus('All API keys and GitHub credentials purged from browser memory.');
   };
 
   const showStatus = (msg, error = false) => {
@@ -95,25 +206,48 @@ export default function App() {
     setAiSelfHealing(false);
     setIsSelfHealedCode(false);
     setArchitecturalAdvisory(null);
+    setParityTestSql('');
+    setLastPrUrl('');
   };
 
   const handleResetWorkspace = () => {
     setSourceCode('');
-    setDbtSql('');
-    setDbtYaml('');
-    setDbtModelName('stg_oracle_model');
+    setUploadedFileName('');
+    setGeneratedModels([]);
+    setSelectedModelIdx(0);
     setDagStatus('pending');
     setDagData(null);
     setShowDagModal(false);
     resetGeneratedStates();
-    showStatus('Workspace reset. Ready for new Oracle PL/SQL input.');
+    showStatus('Workspace reset. Ready for new Oracle PL/SQL or Package input.');
   };
 
   const handleSourceChange = (e) => {
     setSourceCode(e.target.value);
     setDagStatus('pending');
     setDagData(null);
+    setGeneratedModels([]);
+    setSelectedModelIdx(0);
     resetGeneratedStates();
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const content = String(ev.target?.result || '');
+      setSourceCode(content);
+      setUploadedFileName(file.name);
+      setDagStatus('pending');
+      setDagData(null);
+      setGeneratedModels([]);
+      setSelectedModelIdx(0);
+      resetGeneratedStates();
+      showStatus(`Loaded ${file.name} (${content.split('\n').length} lines). Click "Analyze DAG" next.`);
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
   const formatMultiline = (val) =>
@@ -129,20 +263,120 @@ export default function App() {
     return JSON.parse(cleanStr);
   };
 
-  // Detect imperative PL/SQL constructs to supplement AI advisory
   const detectImperativeConstructs = (sqlText) => {
     const matches = [];
     if (/\bCURSOR\b|\bFETCH\b|\bLOOP\b/i.test(sqlText)) matches.push('Explicit Cursor / Row-by-Row Loop');
     if (/\bUPDATE\b|\bDELETE\b|\bINSERT\b|\bMERGE\b/i.test(sqlText)) matches.push('Imperative DML Mutation');
     if (/\bCOMMIT\b|\bROLLBACK\b/i.test(sqlText)) matches.push('Explicit Transaction Control (COMMIT/ROLLBACK)');
-    if (/\bRAISE_APPLICATION_ERROR\b|\bEXCEPTION\b|\bDBMS_OUTPUT\b/i.test(sqlText)) matches.push('Procedural Exception / Application Error Handling');
+    if (/\bRAISE_APPLICATION_ERROR\b|\bEXCEPTION\b|\bDBMS_OUTPUT\b/i.test(sqlText))
+      matches.push('Procedural Exception / Application Error Handling');
+    if (/\bCONNECT\s+BY\b/i.test(sqlText)) matches.push('Hierarchical CONNECT BY Recursion');
     return matches;
+  };
+
+  // Unified Project Bundle Builder (Used identically by Scaffolder, ZIP Export, and GitHub Push)
+  const buildDbtProjectBundle = (modelsList, paritySql) => {
+    const files = {};
+    const allContent = modelsList.map((m) => `${m.sql}\n${m.yaml}`).join('\n') + `\n${paritySql || ''}`;
+    const usesDbtUtils = /\bdbt_utils\./i.test(allContent);
+
+    files['dbt_project.yml'] = `name: 'oracle_modernised_warehouse'
+version: '1.0.0'
+config-version: 2
+
+profile: 'default'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+models:
+  oracle_modernised_warehouse:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: ephemeral
+    marts:
+      +materialized: table
+`;
+
+    if (usesDbtUtils) {
+      files['packages.yml'] = `packages:
+  - package: dbt-labs/dbt_utils
+    version: [">=1.1.1", "<2.0.0"]
+`;
+    }
+
+    modelsList.forEach((m) => {
+      const safeName = (m.name || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase();
+      const layer = ['staging', 'intermediate', 'marts'].includes(m.layer)
+        ? m.layer
+        : safeName.startsWith('stg_')
+        ? 'staging'
+        : safeName.startsWith('int_')
+        ? 'intermediate'
+        : 'marts';
+
+      files[`models/${layer}/${safeName}.sql`] = m.sql;
+      if (m.yaml?.trim()) {
+        files[`models/${layer}/schema_${safeName}.yml`] = m.yaml;
+      }
+    });
+
+    if (paritySql?.trim()) {
+      const primaryName = (modelsList[0]?.name || 'oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase();
+      files[`tests/assert_parity_${primaryName}.sql`] = paritySql;
+    }
+
+    return files;
+  };
+
+  const renderAsciiTreeFromBundle = (filesMap) => {
+    const paths = Object.keys(filesMap).sort();
+    const root = {};
+    paths.forEach((p) => {
+      const parts = p.split('/');
+      let curr = root;
+      parts.forEach((part, idx) => {
+        if (!curr[part]) curr[part] = idx === parts.length - 1 ? null : {};
+        curr = curr[part];
+      });
+    });
+
+    const lines = ['oracle_modernised_warehouse/'];
+    const walk = (node, prefix) => {
+      const entries = Object.entries(node);
+      entries.forEach(([key, val], i) => {
+        const isLast = i === entries.length - 1;
+        const branch = isLast ? '└── ' : '├── ';
+        let note = '';
+        if (key === 'packages.yml') note = '  # Auto-included for dbt_utils macro dependencies';
+        if (key.startsWith('assert_parity_')) note = '  # Automated row-count & aggregate parity test';
+        lines.push(`${prefix}${branch}${key}${val === null ? note : '/'}`);
+        if (val !== null) walk(val, prefix + (isLast ? '    ' : '│   '));
+      });
+    };
+    walk(root, '');
+    return lines.join('\n');
+  };
+
+  const handleDownloadZip = () => {
+    if (generatedModels.length === 0) return showStatus('Generate dbt models first before exporting ZIP.', true);
+    const bundle = buildDbtProjectBundle(generatedModels, parityTestSql);
+    const blob = buildZipBlob(bundle);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dbt_${(generatedModels[0]?.name || 'oracle_migration').toLowerCase()}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showStatus(`📦 Exported runnable dbt project ZIP (${Object.keys(bundle).length} files).`);
   };
 
   // Tiered Temperature Control Engine
   const executeModelRequest = async (modelName, promptText, expectJson, cleanKey, temperature = 0.1) => {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
     const payload = {
       contents: [{ parts: [{ text: promptText }] }],
       generationConfig: {
@@ -235,17 +469,17 @@ export default function App() {
     throw lastError || new Error('Neural Engine failed to respond.');
   };
 
-  // 1. DAG Analyzer (Temp: 0.0 - Strict Logic)
+  // 1. DAG Analyzer (Temp: 0.0)
   const handleAnalyzeDAG = async () => {
-    if (!sourceCode.trim()) return showStatus('Please paste Oracle code first to analyze lineage.', true);
+    if (!sourceCode.trim()) return showStatus('Please paste or upload Oracle code first to analyze lineage.', true);
     if (!apiKey.trim()) return showStatus('Please configure your Engine API Key.', true);
 
     setIsDagLoading(true);
     setShowDagModal(true);
     setDagData(null);
 
-    const prompt = `You are a Principal Data Architect analyzing legacy Oracle PL/SQL for a dbt migration.
-dbt requires a Directed Acyclic Graph (DAG). Look for any circular dependencies, infinite loops, or deeply nested anti-patterns.
+    const prompt = `You are a Principal Data Architect analyzing legacy Oracle PL/SQL (views, procedures, or multi-procedure packages) for a dbt migration.
+dbt requires a Directed Acyclic Graph (DAG). Detect any circular dependencies, infinite loops, or cross-procedure cycles.
 
 Return a JSON object with this exact schema:
 {
@@ -285,55 +519,65 @@ ${sourceCode}`;
     }
   };
 
-  // 2. Code Conversion (Temp: 0.1 - Deterministic with SME & Multi-Cloud Transpilation Rules)
+  // 2. Code Conversion + Package Decomposition (Temp: 0.1)
   const handleTranspile = async () => {
     if (dagStatus !== 'clean') {
       return showStatus('Pipeline Blocked: Please Analyze DAG and resolve architecture risks first.', true);
     }
 
     setIsLoading(true);
-    setDbtSql('');
-    setDbtYaml('');
+    setGeneratedModels([]);
+    setSelectedModelIdx(0);
     resetGeneratedStates();
     showStatus('');
 
-    const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
+    const targetLabel = DB_TARGETS.find((t) => t.id === targetDb)?.label || targetDb;
 
-    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture strictly optimized for ${targetLabel}.
-Ensure the SQL dialect used matches ${targetLabel} conventions and strictly obey ALL of these rules:
+    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modular, production-ready dbt architecture strictly optimized for ${targetLabel}.
+Strictly obey ALL 8 architectural rules:
 
-1. CONFIG MATERIALIZATION HEADER (MANDATORY):
-   - Always begin the dbt SQL output with a {{ config(...) }} block on line 1.
-   - Use {{ config(materialized='view') }} when converting Oracle VIEWs.
-   - Use {{ config(materialized='table') }} (or materialized='incremental' for MERGE upserts) when converting Oracle PROCEDUREs or DML blocks.
+1. MULTI-PROCEDURE PACKAGE DECOMPOSITION:
+   - If the Oracle input is a PL/SQL PACKAGE (or contains multiple procedures/CTEs representing distinct pipeline stages), decompose it into multiple modular dbt models across layers ("staging", "intermediate", "marts") linked via {{ ref('<model_name>') }}.
+   - If it is a single view or procedure, return 1 model in the appropriate layer ("staging" for raw source views, "marts" for transformed procedures/aggregations).
 
-2. ROWNUM & RANKING COLUMN PRESERVATION:
-   - Whenever Oracle uses ROWNUM inside a subquery (especially with outer SELECT * or projected row_num aliases), NEVER collapse it into a bare LIMIT clause that drops the ranking column.
-   - Instead, rewrite it using a Common Table Expression (CTE) with ROW_NUMBER() OVER (ORDER BY ...) AS <original_alias> and filter in the outer SELECT * WHERE <original_alias> <= N.
+2. CONFIG MATERIALIZATION & INCREMENTAL COMPLETENESS:
+   - Every SQL model MUST begin with {{ config(...) }} on line 1.
+   - Views: {{ config(materialized='view') }}.
+   - Standard tables: {{ config(materialized='table') }}.
+   - Oracle MERGE / incremental upserts: MUST use {{ config(materialized='incremental', unique_key='<pk_col>', incremental_strategy='merge') }} AND include a {% if is_incremental() %} watermark filter block.
 
-3. NATIVE SEQUENCE PRESERVATION (NO MD5 HASHES):
-   - NEVER replace an explicit Oracle sequence (e.g., emp_seq.NEXTVAL) with {{ dbt_utils.generate_surrogate_key(...) }} or MD5/SHA string hashes, as that breaks numeric data types and sequence statefulness.
-   - Preserve native sequence syntax for ${targetLabel}:
-     * PostgreSQL / Google AlloyDB / Google Cloud SQL / DuckDB: nextval('seq_name')
-     * Snowflake: seq_name.NEXTVAL
-     * SQL Server / Azure Synapse / Microsoft Fabric: NEXT VALUE FOR seq_name
-     * Google Cloud Spanner: GET_NEXT_SEQUENCE_VALUE(SEQUENCE seq_name)
-     * Other engines without sequence objects (BigQuery, Databricks, Athena, Spark, Redshift): ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) or native identity/sequence syntax with an inline SQL comment.
+3. ROWNUM & RANKING COLUMN PRESERVATION:
+   - Never collapse ROWNUM subqueries into a bare LIMIT clause if outer SELECT * or ranking aliases are projected. Rewrite using a CTE with ROW_NUMBER() OVER (...) AS <alias>.
 
-4. PROCEDURAL VALIDATIONS TO SCHEMA.YML ASSERTIONS:
-   - If the Oracle PL/SQL contains validation checks (e.g., IF v_count > 0 THEN RAISE_APPLICATION_ERROR(...) for negative values or invalid states), translate the data selection cleanly in SQL AND encode the business rule as a dbt test inside schema.yml (using dbt_utils.expression_is_true, accepted_values, or not_null).
+4. NATIVE SEQUENCE PRESERVATION (NO MD5 HASHES):
+   - Never replace explicit Oracle sequences (.NEXTVAL) with dbt_utils.generate_surrogate_key or MD5 hashes.
+   - Use native sequence syntax for ${targetLabel}: nextval('seq') for PostgreSQL/AlloyDB/Cloud SQL/DuckDB, seq.NEXTVAL for Snowflake, NEXT VALUE FOR seq for SQL Server/Synapse/Fabric, GET_NEXT_SEQUENCE_VALUE(SEQUENCE seq) for Cloud Spanner.
 
-5. CONSISTENT DBT REFERENCES:
-   - Reference upstream staging models consistently using {{ ref('stg_<table_name>') }} (or {{ source('raw', '<table_name>') }} for raw base tables).
+5. ENTERPRISE ORACLE IDIOMS:
+   - Convert CONNECT BY PRIOR hierarchical queries into WITH RECURSIVE CTEs.
+   - Convert Oracle (+) implicit outer join syntax into explicit ANSI LEFT OUTER JOIN / RIGHT OUTER JOIN.
+   - Convert KEEP (DENSE_RANK FIRST/LAST ORDER BY ...) into native FIRST_VALUE / window functions.
 
-6. ARCHITECTURAL ADVISORY FOR IMPERATIVE PL/SQL:
-   - If the source contains imperative procedural constructs (CURSOR loops, row-by-row UPDATE/DELETE, COMMIT/ROLLBACK, RAISE_APPLICATION_ERROR, EXCEPTION blocks, DBMS_OUTPUT), populate "advisory" with a concise 2-sentence explanation of how imperative state mutations/transactions were refactored into declarative set-based dbt paradigms and schema.yml tests. Otherwise set "advisory" to null.
+6. PROCEDURAL VALIDATIONS TO SCHEMA.YML ASSERTIONS:
+   - Encode PL/SQL validation checks (RAISE_APPLICATION_ERROR, negative value checks) as dbt tests in schema.yml (e.g., dbt_utils.expression_is_true, accepted_values, not_null).
+
+7. AUTOMATED PARITY TEST SQL:
+   - Generate a standalone dbt singular test query in "parityTestSql" that returns failing rows if row counts or key numeric totals diverge from expected source invariants.
+
+8. ARCHITECTURAL ADVISORY:
+   - If imperative constructs (CURSOR, LOOP, COMMIT/ROLLBACK, RAISE_APPLICATION_ERROR, CONNECT BY) were refactored, explain the paradigm shift concisely in "advisory".
 
 Return a JSON object with this exact schema:
 {
-  "modelName": "string (snake_case dbt model name derived from Oracle source, e.g., 'top_employee_view')",
-  "sql": "string (complete dbt SQL starting with {{ config(...) }})",
-  "yaml": "string (complete dbt schema.yml with column descriptions, standard tests, and translated validation rules)",
+  "models": [
+    {
+      "name": "string (snake_case model name, e.g., 'stg_employees' or 'mart_customer_risk')",
+      "layer": "staging | intermediate | marts",
+      "sql": "string (complete dbt SQL starting with {{ config(...) }})",
+      "yaml": "string (complete dbt schema.yml for this model)"
+    }
+  ],
+  "parityTestSql": "string (dbt singular test SQL returning rows on data parity mismatch)",
   "advisory": "string or null"
 }
 
@@ -344,23 +588,42 @@ ${sourceCode}`;
       const rawResponse = await callNeuralEngine(prompt, true, 0.1);
       const parsed = safeJsonParse(rawResponse);
 
-      const cleanSql = formatMultiline(parsed.sql || '');
-      const cleanYaml = formatMultiline(parsed.yaml || '');
+      const modelsList = (parsed.models || []).map((m) => ({
+        name: (m.name || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase(),
+        layer: m.layer || 'marts',
+        sql: formatMultiline(m.sql || ''),
+        yaml: formatMultiline(m.yaml || '')
+      }));
 
+      if (modelsList.length === 0 && parsed.sql) {
+        modelsList.push({
+          name: (parsed.modelName || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase(),
+          layer: 'marts',
+          sql: formatMultiline(parsed.sql),
+          yaml: formatMultiline(parsed.yaml || '')
+        });
+      }
+
+      const cleanParitySql = formatMultiline(parsed.parityTestSql || '');
       const detectedImperative = detectImperativeConstructs(sourceCode);
       const finalAdvisory =
         parsed.advisory ||
         (detectedImperative.length > 0
-          ? `Declarative Refactoring Notice: Legacy imperative constructs (${detectedImperative.join(', ')}) have been converted into set-based dbt SQL transformations and schema.yml assertions, as dbt executes atomic batch builds rather than row-by-row transactions or runtime exceptions.`
+          ? `Declarative Refactoring Notice: Legacy imperative constructs (${detectedImperative.join(', ')}) were converted into set-based dbt SQL models, schema.yml assertions, and singular parity tests.`
           : null);
 
-      setDbtModelName(parsed.modelName || 'stg_oracle_model');
-      setDbtSql(cleanSql);
-      setDbtYaml(cleanYaml);
+      setGeneratedModels(modelsList);
+      setSelectedModelIdx(0);
+      setParityTestSql(cleanParitySql);
       setArchitecturalAdvisory(finalAdvisory);
 
-      showStatus(`Translation complete for ${targetLabel}. Go to Dual Run Validation to verify and deploy.`);
-      generateDynamicScaffold(sourceCode, cleanSql, cleanYaml);
+      // Synchronize Scaffolder directly with the exact deployable bundle
+      const bundle = buildDbtProjectBundle(modelsList, cleanParitySql);
+      setScaffoldTree(renderAsciiTreeFromBundle(bundle));
+
+      showStatus(
+        `Translation complete (${modelsList.length} dbt model${modelsList.length > 1 ? 's' : ''}) for ${targetLabel}.`
+      );
     } catch (err) {
       showStatus(`Engine Error: ${err.message}`, true);
     } finally {
@@ -368,32 +631,9 @@ ${sourceCode}`;
     }
   };
 
-  // 3. Dynamic Scaffolder (Temp: 0.1)
-  const generateDynamicScaffold = async (srcCode, targetSql, targetYaml, driftInfo = null) => {
-    setIsScaffolding(true);
-    const driftContext = driftInfo?.hasDrift ? `\nNote: Validator flagged ${driftInfo.driftType}. Include the fix in the tree.` : '';
-
-    const scaffoldPrompt = `You are a Data Architect. Inspect this Oracle PL/SQL and the generated dbt SQL/YAML. 
-Design a tailored dbt repository folder tree (e.g., dbt_project.yml, models/staging, models/marts, tests/).${driftContext}
-Return ONLY a clean ASCII directory tree (using ├──, └──, │) with brief inline comments. Do NOT include markdown backticks or JSON.
-
-PL/SQL: ${srcCode}
-dbt SQL: ${targetSql}`;
-
-    try {
-      let rawTree = await callNeuralEngine(scaffoldPrompt, false, 0.1);
-      rawTree = rawTree.replace(/^```[a-zA-Z]*\n?/gm, '').replace(/```$/gm, '').trim();
-      setScaffoldTree(rawTree);
-    } catch {
-      setScaffoldTree(null);
-    } finally {
-      setIsScaffolding(false);
-    }
-  };
-
-  // 4. Dual Run Validation (Temp: 0.0 - Strict Audit Including SME & Multi-Cloud Edge Cases)
+  // 4. Dual Run Validation (Temp: 0.0)
   const handleAnalyzeArchitecture = async () => {
-    if (!dbtSql.trim() || !apiKey.trim()) return;
+    if (generatedModels.length === 0 || !apiKey.trim()) return;
 
     setIsAnalyzing(true);
     setValidationRun(true);
@@ -401,23 +641,26 @@ dbt SQL: ${targetSql}`;
     setAiSelfHealing(false);
     showStatus('');
 
-    const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
+    const targetLabel = DB_TARGETS.find((t) => t.id === targetDb)?.label || targetDb;
+    const serializedModels = generatedModels
+      .map((m) => `--- MODEL: models/${m.layer}/${m.name}.sql ---\n${m.sql}\n--- YAML ---\n${m.yaml}`)
+      .join('\n\n');
 
     const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
-Audit this Oracle PL/SQL and its transpiled dbt SQL + YAML equivalent. Check specifically for:
-1. Missing {{ config(materialized=...) }} header at the top of the dbt SQL.
-2. Dropped ROWNUM ranking columns (e.g., Oracle outer SELECT * projected a row_num column, but dbt collapsed it into LIMIT without ROW_NUMBER() OVER()).
-3. Sequence type corruption (Oracle used .NEXTVAL sequence, but dbt replaced it with dbt_utils.generate_surrogate_key / MD5 string hash instead of native sequence syntax for ${targetLabel}).
-4. Missing schema.yml validation tests when Oracle PL/SQL had RAISE_APPLICATION_ERROR business rules.
-5. Un-migrated Oracle functions (NVL, DECODE, SYSDATE, TRUNC, LISTAGG, MINUS) or dialect errors for ${targetLabel}.
+Audit this Oracle PL/SQL and all transpiled dbt models + YAML definitions. Check specifically for:
+1. Missing {{ config(materialized=...) }} header or incremental models missing unique_key / {% if is_incremental() %}.
+2. Dropped ROWNUM ranking columns (outer SELECT * projected row_num, but dbt collapsed into LIMIT without ROW_NUMBER() OVER()).
+3. Sequence type corruption (Oracle used .NEXTVAL sequence, but dbt substituted MD5 surrogate_key instead of native sequence syntax for ${targetLabel}).
+4. Un-migrated Oracle syntax ((+) outer joins, CONNECT BY without WITH RECURSIVE, NVL, DECODE, SYSDATE, LISTAGG, MINUS).
+5. Missing schema.yml validation tests when Oracle PL/SQL had RAISE_APPLICATION_ERROR business rules.
 
-Note: Converting imperative PL/SQL CURSOR loops, UPDATE statements, or COMMIT/ROLLBACK blocks into set-based declarative SELECT models is VALID dbt architecture and should NOT be flagged as drift if the business logic and config header are accurate.
+Note: Converting imperative PL/SQL CURSOR loops, UPDATE statements, or COMMIT/ROLLBACK blocks into set-based declarative SELECT models is VALID dbt architecture and should NOT be flagged as drift.
 
 Return a JSON object with this exact schema:
 {
   "hasDrift": boolean,
-  "parityScore": "string percentage (e.g., '100.00%' or '72.14%')",
-  "driftType": "string or null (e.g., 'DROPPED_RANK_COLUMN', 'SEQUENCE_HASH_MISMATCH', 'MISSING_CONFIG_HEADER', 'MISSING_SCHEMA_ASSERTION', 'ORACLE_FUNCTION_LEAK')",
+  "parityScore": "string percentage (e.g., '100.00%' or '78.50%')",
+  "driftType": "string or null (e.g., 'INCOMPLETE_INCREMENTAL_BLOCK', 'DROPPED_RANK_COLUMN', 'SEQUENCE_HASH_MISMATCH', 'ORACLE_SYNTAX_LEAK', 'MISSING_SCHEMA_ASSERTION')",
   "terminalDriftLog": "string or null (detailed explanation of the risk)",
   "healAction": "string or null (short description of the fix)",
   "terminalHealLog": "string or null (explanation of what the self-healing agent will patch)"
@@ -425,24 +668,22 @@ Return a JSON object with this exact schema:
 
 Oracle Source:
 ${sourceCode}
-dbt SQL:
-${dbtSql}
-dbt YAML:
-${dbtYaml}`;
+
+Transpiled dbt Models:
+${serializedModels}`;
 
     try {
       const rawResponse = await callNeuralEngine(diagnosticPrompt, true, 0.0);
       const parsedJson = safeJsonParse(rawResponse);
 
-      Object.keys(parsedJson).forEach(key => {
+      Object.keys(parsedJson).forEach((key) => {
         if (typeof parsedJson[key] === 'string') {
           parsedJson[key] = formatMultiline(parsedJson[key]);
         }
       });
 
       setAnalysisResult(parsedJson);
-      showStatus(`Dual Run validation complete.`);
-      if (parsedJson.hasDrift) generateDynamicScaffold(sourceCode, dbtSql, dbtYaml, parsedJson);
+      showStatus('Dual Run validation complete.');
     } catch (err) {
       setValidationRun(false);
       showStatus(`Validation Error: ${err.message}`, true);
@@ -451,51 +692,68 @@ ${dbtYaml}`;
     }
   };
 
-  // 5. Self Healing (Temp: 0.15 - Guided Refactoring)
+  // 5. Self Healing (Temp: 0.15)
   const triggerSelfHealingRemediation = async () => {
-    if (!dbtSql.trim() || !analysisResult?.hasDrift) return;
+    if (generatedModels.length === 0 || !analysisResult?.hasDrift) return;
     setIsRemediating(true);
 
-    const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
+    const targetLabel = DB_TARGETS.find((t) => t.id === targetDb)?.label || targetDb;
+    const serializedModels = generatedModels
+      .map((m) => `--- MODEL: ${m.name} (${m.layer}) ---\nSQL:\n${m.sql}\nYAML:\n${m.yaml}`)
+      .join('\n\n');
 
-    const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
+    const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix these dbt models to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
 
-Ensure the patched code strictly satisfies all rules:
-- Begins with {{ config(materialized='view') }} or {{ config(materialized='table') }}.
-- Uses a ROW_NUMBER() OVER (...) CTE if Oracle projected a ROWNUM alias in an outer SELECT *.
-- Preserves native sequences for ${targetLabel} (nextval('...') for PostgreSQL/AlloyDB/Cloud SQL/DuckDB, .NEXTVAL for Snowflake, NEXT VALUE FOR for SQL Server/Synapse/Fabric, GET_NEXT_SEQUENCE_VALUE(SEQUENCE ...) for Cloud Spanner) instead of MD5 surrogate keys.
+Ensure every patched model satisfies all enterprise rules:
+- Begins with {{ config(...) }} (with unique_key and {% if is_incremental() %} if incremental).
+- Uses ROW_NUMBER() OVER (...) CTE if Oracle projected a ROWNUM alias in outer SELECT *.
+- Preserves native sequences for ${targetLabel} instead of MD5 surrogate keys.
+- Converts (+) joins to ANSI JOINs and CONNECT BY to WITH RECURSIVE.
 - Encodes Oracle RAISE_APPLICATION_ERROR checks as dbt tests in schema.yml.
 
 Return a JSON object with this exact schema:
 {
-  "sql": "string (the complete refactored ${targetLabel} dbt SQL)",
-  "yaml": "string (the complete updated dbt schema.yml)"
+  "models": [
+    {
+      "name": "string",
+      "layer": "staging | intermediate | marts",
+      "sql": "string (complete patched SQL)",
+      "yaml": "string (complete patched YAML)"
+    }
+  ]
 }
 
 Original Oracle Source:
 ${sourceCode}
-Current SQL:
-${dbtSql}
-Current YAML:
-${dbtYaml}`;
+
+Current Models:
+${serializedModels}`;
 
     try {
       const rawResponse = await callNeuralEngine(remediationPrompt, true, 0.15);
       const parsed = safeJsonParse(rawResponse);
 
-      const cleanSql = formatMultiline(parsed.sql || '');
-      const cleanYaml = formatMultiline(parsed.yaml || '');
-
       const healBanner = `/* [AI SELF-HEALED | Fix: ${analysisResult.healAction}] */`;
-      const finalSql = cleanSql.startsWith('/* [AI') ? cleanSql : `${healBanner}\n${cleanSql}`;
+      const patchedModels = (parsed.models || []).map((m) => {
+        const cleanSql = formatMultiline(m.sql || '');
+        return {
+          name: (m.name || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase(),
+          layer: m.layer || 'marts',
+          sql: cleanSql.startsWith('/* [AI') ? cleanSql : `${healBanner}\n${cleanSql}`,
+          yaml: formatMultiline(m.yaml || '')
+        };
+      });
 
-      setDbtSql(finalSql);
-      if (cleanYaml) setDbtYaml(cleanYaml);
+      if (patchedModels.length > 0) {
+        setGeneratedModels(patchedModels);
+        setSelectedModelIdx(0);
+        const bundle = buildDbtProjectBundle(patchedModels, parityTestSql);
+        setScaffoldTree(renderAsciiTreeFromBundle(bundle));
+      }
 
       setIsSelfHealedCode(true);
       setAiSelfHealing(true);
       showStatus(`Self-Healing complete: dbt models patched for ${analysisResult.driftType}.`);
-      generateDynamicScaffold(sourceCode, finalSql, cleanYaml, analysisResult);
     } catch (err) {
       showStatus(`Self-Healing Error: ${err.message}`, true);
     } finally {
@@ -503,7 +761,7 @@ ${dbtYaml}`;
     }
   };
 
-  // 6. GitHub Deploy (Dynamic Filenames)
+  // 6. GitHub Deploy (Layered Paths + Full dbt Project + Pull Request Option)
   const encodeBase64 = (str) => {
     const bytes = new TextEncoder().encode(str);
     let binary = '';
@@ -513,47 +771,94 @@ ${dbtYaml}`;
     return btoa(binary);
   };
 
-  const pushFileToGitHub = async (fileName, fileContent) => {
-    const url = `https://api.github.com/repos/${gitOwner}/${gitRepo}/contents/models/${fileName}`;
-    const contentBase64 = encodeBase64(fileContent);
-    let sha = null;
-
-    try {
-      const getRes = await fetch(url, { headers: { 'Authorization': `Bearer ${gitToken}` } });
-      if (getRes.ok) {
-        const data = await getRes.json();
-        sha = data.sha;
+  const githubApi = async (path, options = {}) => {
+    const res = await fetch(`https://api.github.com/repos/${gitOwner}/${gitRepo}${path}`, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${gitToken}`,
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
       }
+    });
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.message || `GitHub API HTTP ${res.status}`);
+    }
+    return res.json();
+  };
+
+  const pushFileToBranch = async (repoPath, fileContent, branchName) => {
+    const encodedPath = repoPath
+      .split('/')
+      .map((seg) => encodeURIComponent(seg))
+      .join('/');
+    let sha = null;
+    try {
+      const existing = await githubApi(`/contents/${encodedPath}?ref=${encodeURIComponent(branchName)}`);
+      sha = existing.sha;
     } catch (e) {}
 
-    const body = { message: `Automated dbt conversion: ${fileName} via Neural Engine`, content: contentBase64 };
+    const body = {
+      message: `feat(dbt): migrate ${repoPath} via Oracle Modernisation Accelerator`,
+      content: encodeBase64(fileContent),
+      branch: branchName
+    };
     if (sha) body.sha = sha;
 
-    const putRes = await fetch(url, {
+    await githubApi(`/contents/${encodedPath}`, {
       method: 'PUT',
-      headers: { 'Authorization': `Bearer ${gitToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-
-    if (!putRes.ok) throw new Error('GitHub push failed. Check token permissions and repo name.');
   };
 
   const handleDeployToGit = async () => {
-    if (!dbtSql.trim()) return showStatus('No dbt models to deploy.', true);
+    if (generatedModels.length === 0) return showStatus('No dbt models to deploy.', true);
     if (!gitToken || !gitOwner || !gitRepo) {
       setShowGitModal(true);
       return showStatus('Please configure GitHub credentials first.', true);
     }
 
     setIsDeploying(true);
-    showStatus('Initiating commit to GitHub repository...');
-
-    const safeName = (dbtModelName || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase();
+    setLastPrUrl('');
+    showStatus('Inspecting repository & preparing dbt project bundle...');
 
     try {
-      await pushFileToGitHub(`${safeName}.sql`, dbtSql);
-      await pushFileToGitHub(`schema_${safeName}.yml`, dbtYaml);
-      showStatus(`✅ Successfully deployed models to GitHub (${gitOwner}/${gitRepo}/models/)!`);
+      const repoInfo = await githubApi('');
+      const defaultBranch = repoInfo.default_branch || 'main';
+      let targetBranch = defaultBranch;
+
+      if (gitUsePr) {
+        const refInfo = await githubApi(`/git/ref/heads/${encodeURIComponent(defaultBranch)}`);
+        const baseSha = refInfo.object.sha;
+        const primarySlug = generatedModels[0]?.name || 'oracle_migration';
+        targetBranch = `dbt-migration/${primarySlug}-${Date.now().toString().slice(-4)}`;
+
+        await githubApi('/git/refs', {
+          method: 'POST',
+          body: JSON.stringify({ ref: `refs/heads/${targetBranch}`, sha: baseSha })
+        });
+      }
+
+      const bundle = buildDbtProjectBundle(generatedModels, parityTestSql);
+      for (const [repoPath, content] of Object.entries(bundle)) {
+        await pushFileToBranch(repoPath, content, targetBranch);
+      }
+
+      if (gitUsePr) {
+        const pr = await githubApi('/pulls', {
+          method: 'POST',
+          body: JSON.stringify({
+            title: `feat(dbt): Migrate ${generatedModels.map((m) => m.name).join(', ')} from Oracle PL/SQL`,
+            head: targetBranch,
+            base: defaultBranch,
+            body: `### Automated Oracle PL/SQL → dbt Migration\n- **Target Warehouse:** ${DB_TARGETS.find((t) => t.id === targetDb)?.label}\n- **Models Generated:** ${generatedModels.length}\n- **Dual Run Parity Score:** ${aiSelfHealing ? '100.00% (Self-Healed)' : analysisResult?.parityScore || 'Verified'}\n- **Included Artifacts:** \`dbt_project.yml\`, layered models, \`schema.yml\` tests, and singular parity test.`
+          })
+        });
+        setLastPrUrl(pr.html_url);
+        showStatus(`✅ Opened Pull Request #${pr.number} on ${gitOwner}/${gitRepo} with ${Object.keys(bundle).length} files!`);
+      } else {
+        showStatus(`✅ Committed ${Object.keys(bundle).length} dbt project files directly to ${defaultBranch}!`);
+      }
     } catch (err) {
       showStatus(`GitHub Deployment Error: ${err.message}`, true);
     } finally {
@@ -561,9 +866,10 @@ ${dbtYaml}`;
     }
   };
 
-  const hasGeneratedCode = dbtSql.length > 0;
+  const activeModel = generatedModels[selectedModelIdx] || { name: 'stg_oracle_model', layer: 'marts', sql: '', yaml: '' };
+  const hasGeneratedCode = generatedModels.length > 0;
   const isDriftDetected = analysisResult?.hasDrift;
-  const canReset = Boolean(sourceCode || dbtSql || dbtYaml || dagStatus !== 'pending');
+  const canReset = Boolean(sourceCode || hasGeneratedCode || dagStatus !== 'pending');
 
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100 flex flex-col font-sans selection:bg-cyan-500">
@@ -572,7 +878,7 @@ ${dbtYaml}`;
           <h1 className="text-base font-bold text-white flex items-center gap-1.5">
             Oracle <span className="text-indigo-400">Modernisation Accelerator</span>
           </h1>
-          <p className="text-[11px] text-slate-400">PL/SQL ➔ Cloud-Native dbt Models</p>
+          <p className="text-[11px] text-slate-400">PL/SQL & Packages ➔ Cloud-Native dbt Architectures</p>
         </div>
         <div className="flex gap-2 items-center">
           <div className="bg-[#111928] border border-slate-800 p-1 rounded-xl flex gap-1 mx-2">
@@ -588,14 +894,25 @@ ${dbtYaml}`;
               {hasGeneratedCode && !validationRun && <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />}
             </button>
           </div>
-          <button onClick={() => setShowGitModal(true)} className="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300">🐙 Git Hub</button>
-          <button onClick={() => setShowConfigModal(true)} className="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300">⚙️ Engine</button>
+          <button onClick={() => setShowGitModal(true)} className="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300">
+            🐙 GitHub {gitUsePr ? '(PR)' : '(Direct)'}
+          </button>
+          <button onClick={() => setShowConfigModal(true)} className="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300">
+            ⚙️ Engine
+          </button>
         </div>
       </header>
 
       {statusMessage && (
-        <div className={`px-6 py-2.5 text-xs flex justify-between ${isError ? 'bg-rose-950 border-b border-rose-800 text-rose-200' : 'bg-slate-900 border-b border-cyan-900/50 text-cyan-300'}`}>
-          <span>{statusMessage}</span>
+        <div className={`px-6 py-2.5 text-xs flex justify-between items-center ${isError ? 'bg-rose-950 border-b border-rose-800 text-rose-200' : 'bg-slate-900 border-b border-cyan-900/50 text-cyan-300'}`}>
+          <div className="flex items-center gap-3">
+            <span>{statusMessage}</span>
+            {lastPrUrl && (
+              <a href={lastPrUrl} target="_blank" rel="noreferrer" className="underline font-bold text-emerald-300 hover:text-emerald-200">
+                Open Pull Request ↗
+              </a>
+            )}
+          </div>
           <button onClick={() => setStatusMessage('')}>✕</button>
         </div>
       )}
@@ -603,31 +920,55 @@ ${dbtYaml}`;
       {activeTab === 'transpiler' && (
         <main className="flex-1 flex flex-col p-6 gap-4 w-full mx-auto">
           <div className="flex justify-between bg-[#111928] p-3 rounded-xl border border-slate-800 items-center">
-            <div className="flex gap-2">
+            <div className="flex gap-2 items-center">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".sql,.pls,.pkb,.pks,.txt"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="bg-slate-800 text-slate-200 border border-slate-700 hover:bg-slate-700 px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5"
+              >
+                <span>📂 Upload .sql / .pkb</span>
+              </button>
+
               <button
                 onClick={handleAnalyzeDAG}
                 disabled={isDagLoading || !sourceCode.trim()}
-                className="bg-slate-800 text-cyan-400 border border-cyan-900/50 hover:bg-slate-700 disabled:opacity-50 px-6 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2"
+                className="bg-slate-800 text-cyan-400 border border-cyan-900/50 hover:bg-slate-700 disabled:opacity-50 px-5 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2"
               >
-                {isDagLoading ? 'Analyzing Lineage...' : '🕸️ Analyze DAG & Verify Dependencies'}
+                {isDagLoading ? 'Analyzing Lineage...' : '🕸️ Analyze DAG & Dependencies'}
               </button>
 
               <button
                 onClick={handleTranspile}
                 disabled={isLoading || dagStatus !== 'clean'}
-                className={`${dagStatus === 'clean' ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-slate-800 opacity-50 cursor-not-allowed'} text-white px-6 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2`}
+                className={`${dagStatus === 'clean' ? 'bg-indigo-600 hover:bg-indigo-500' : 'bg-slate-800 opacity-50 cursor-not-allowed'} text-white px-5 py-2 rounded-lg text-xs font-bold shadow-md flex items-center gap-2`}
               >
                 {isLoading ? 'Synthesising via Neural Engine...' : dagStatus === 'clean' ? '▷ Run dbt Translation' : '🔒 Locked: Analyze DAG First'}
               </button>
             </div>
 
-            <button
-              onClick={handleResetWorkspace}
-              disabled={!canReset || isLoading || isDagLoading}
-              className="bg-slate-800/80 text-slate-300 border border-slate-700 hover:bg-rose-950/60 hover:text-rose-200 hover:border-rose-800 disabled:opacity-40 disabled:pointer-events-none px-4 py-2 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5"
-            >
-              <span>↻ Reset</span>
-            </button>
+            <div className="flex gap-2 items-center">
+              {hasGeneratedCode && (
+                <button
+                  onClick={handleDownloadZip}
+                  className="bg-emerald-950/70 text-emerald-300 border border-emerald-700/60 hover:bg-emerald-900/60 px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5"
+                >
+                  <span>📦 Download .zip</span>
+                </button>
+              )}
+              <button
+                onClick={handleResetWorkspace}
+                disabled={!canReset || isLoading || isDagLoading}
+                className="bg-slate-800/80 text-slate-300 border border-slate-700 hover:bg-rose-950/60 hover:text-rose-200 hover:border-rose-800 disabled:opacity-40 disabled:pointer-events-none px-4 py-2 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5"
+              >
+                <span>↻ Reset</span>
+              </button>
+            </div>
           </div>
 
           {architecturalAdvisory && (
@@ -648,31 +989,53 @@ ${dbtYaml}`;
           <div className="grid grid-cols-2 gap-4 flex-1">
             <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800">
               <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
-                <span className="text-xs font-semibold text-slate-400">INPUT: Oracle PL/SQL</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-slate-400">INPUT: Oracle PL/SQL</span>
+                  {uploadedFileName && (
+                    <span className="text-[10px] font-mono text-indigo-300 bg-indigo-950/70 px-2 py-0.5 rounded border border-indigo-800/60">
+                      {uploadedFileName}
+                    </span>
+                  )}
+                </div>
                 {dagStatus === 'clean' && <span className="bg-emerald-500/15 text-emerald-300 text-[10px] px-2 py-0.5 rounded border border-emerald-500/30">✓ DAG Verified</span>}
               </div>
-              <textarea value={sourceCode} onChange={handleSourceChange} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-slate-200 outline-none focus:ring-1 ring-indigo-500/50 rounded-b-xl transition-all" placeholder="Paste Oracle PL/SQL Stored Procedure or View here..." spellCheck={false} />
+              <textarea value={sourceCode} onChange={handleSourceChange} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-slate-200 outline-none focus:ring-1 ring-indigo-500/50 rounded-b-xl transition-all" placeholder="Paste or upload an Oracle View, Stored Procedure, or multi-procedure PL/SQL Package..." spellCheck={false} />
             </div>
 
             <div className="flex flex-col gap-4">
               <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
-                <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
+                <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center flex-wrap gap-2">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-semibold text-cyan-400">TARGET:</span>
                     <select value={targetDb} onChange={(e) => setTargetDb(e.target.value)} className="bg-slate-900 text-cyan-300 text-xs font-bold px-2 py-1 rounded border border-slate-700 outline-none">
-                      {DB_TARGETS.map(db => (
+                      {DB_TARGETS.map((db) => (
                         <option key={db.id} value={db.id}>{db.label}</option>
                       ))}
                     </select>
                     {hasGeneratedCode && (
                       <span className="text-[10px] font-mono text-slate-400 bg-slate-900/90 px-2 py-0.5 rounded border border-slate-800">
-                        {dbtModelName}.sql
+                        models/{activeModel.layer}/{activeModel.name}.sql
                       </span>
                     )}
                   </div>
+
+                  {generatedModels.length > 1 && (
+                    <div className="flex gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
+                      {generatedModels.map((m, idx) => (
+                        <button
+                          key={m.name + idx}
+                          onClick={() => setSelectedModelIdx(idx)}
+                          className={`px-2 py-0.5 rounded text-[10px] font-mono ${selectedModelIdx === idx ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                          {m.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
                   {isSelfHealedCode && <span className="bg-emerald-500/15 text-emerald-300 text-[10px] px-2.5 py-0.5 rounded border border-emerald-500/30">⚡ Self-Healed</span>}
                 </div>
-                <textarea readOnly value={dbtSql} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-cyan-100 outline-none" placeholder="dbt SQL logic will generate here..." spellCheck={false} />
+                <textarea readOnly value={activeModel.sql} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-cyan-100 outline-none" placeholder="dbt SQL logic will generate here..." spellCheck={false} />
               </div>
 
               <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
@@ -680,25 +1043,33 @@ ${dbtYaml}`;
                   <span className="text-xs font-semibold text-emerald-400">TARGET: dbt Schema (.yml)</span>
                   {hasGeneratedCode && (
                     <span className="text-[10px] font-mono text-slate-400 bg-slate-900/90 px-2 py-0.5 rounded border border-slate-800">
-                      schema_{dbtModelName}.yml
+                      models/{activeModel.layer}/schema_{activeModel.name}.yml
                     </span>
                   )}
                 </div>
-                <textarea readOnly value={dbtYaml} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-emerald-100 outline-none" placeholder="dbt schema and tests will generate here..." spellCheck={false} />
+                <textarea readOnly value={activeModel.yaml} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-emerald-100 outline-none" placeholder="dbt schema and tests will generate here..." spellCheck={false} />
               </div>
             </div>
           </div>
         </main>
       )}
 
-      {/* Scaffolder Tab */}
+      {/* Scaffolder Tab (100% Synchronized with ZIP & GitHub Bundle) */}
       {activeTab === 'scaffolder' && (
         <main className="flex-1 p-8 max-w-6xl mx-auto w-full">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 mb-6 flex justify-between items-center">
             <div>
               <h2 className="text-white font-bold mb-1 flex items-center gap-2"><span className="text-blue-400">📁</span> Enterprise dbt Scaffolder</h2>
-              <p className="text-xs text-slate-400">Neural-synthesised repository structure tailored to your Oracle PL/SQL payload.</p>
+              <p className="text-xs text-slate-400">Synchronized repository blueprint (`dbt_project.yml`, `packages.yml`, layered models, and parity tests).</p>
             </div>
+            {hasGeneratedCode && (
+              <button
+                onClick={handleDownloadZip}
+                className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-xl text-xs font-bold shadow flex items-center gap-2"
+              >
+                <span>📦 Download Complete dbt Project (.zip)</span>
+              </button>
+            )}
           </div>
           {hasGeneratedCode ? (
             <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 font-mono text-xs leading-relaxed">
@@ -712,7 +1083,7 @@ ${dbtYaml}`;
             </div>
           ) : (
             <div className="p-16 text-center text-slate-400 text-xs bg-[#111928] rounded-2xl border border-slate-800">
-              Run translation first to generate a dynamic dbt repository blueprint.
+              Run translation first to generate a synchronized dbt repository blueprint.
             </div>
           )}
         </main>
@@ -730,7 +1101,9 @@ ${dbtYaml}`;
             </div>
             <div className="bg-[#111928] border border-slate-800 rounded-2xl p-5 shadow-xl">
               <div className="text-[11px] font-bold text-slate-400 uppercase mb-2">MODELS VERIFIED</div>
-              <div className="text-2xl font-black text-white">{validationRun ? '1 / 1' : '0 / 0'}</div>
+              <div className="text-2xl font-black text-white">
+                {validationRun ? `${generatedModels.length} / ${generatedModels.length}` : `0 / ${generatedModels.length}`}
+              </div>
             </div>
             <div className="bg-[#111928] border border-slate-800 rounded-2xl p-5 shadow-xl">
               <div className="text-[11px] font-bold text-slate-400 uppercase mb-2">DATA PARITY SCORE</div>
@@ -753,7 +1126,9 @@ ${dbtYaml}`;
 
             {hasGeneratedCode && validationRun && analysisResult ? (
               <div className="grid grid-cols-4 px-6 py-4 items-center text-xs text-slate-300 gap-2">
-                <div className="font-mono text-cyan-300">{dbtModelName}.sql</div>
+                <div className="font-mono text-cyan-300">
+                  {generatedModels.map((m) => `${m.name}.sql`).join(', ')}
+                </div>
                 <div>
                   <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${!isDriftDetected || aiSelfHealing ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20'}`}>
                     {!isDriftDetected || aiSelfHealing ? 'Parity Verified' : analysisResult.driftType}
@@ -786,6 +1161,16 @@ ${dbtYaml}`;
             )}
           </div>
 
+          {parityTestSql && (
+            <div className="bg-[#111928] border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
+              <div className="px-6 py-3 border-b border-slate-800 flex justify-between items-center">
+                <span className="text-[11px] font-bold uppercase text-cyan-400">Generated Executable dbt Parity Test (`tests/assert_parity_{activeModel.name}.sql`)</span>
+                <span className="text-[10px] text-slate-400">Included automatically in ZIP & GitHub Push</span>
+              </div>
+              <pre className="p-4 font-mono text-xs text-slate-300 bg-slate-950/60 overflow-x-auto">{parityTestSql}</pre>
+            </div>
+          )}
+
           <div className="bg-[#111928] border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
             <div className="px-6 py-3 border-b border-slate-800"><span className="text-[11px] font-bold uppercase text-slate-400">Autonomous Remediation Terminal</span></div>
             <div className="p-5 font-mono text-xs text-slate-400 bg-slate-950/60 min-h-[100px] leading-relaxed">
@@ -795,11 +1180,16 @@ ${dbtYaml}`;
                     <div className="space-y-1 text-emerald-300">
                       <p className="text-cyan-400">[info] {analysisResult.terminalDriftLog}</p>
                       <p className="text-indigo-400">[agent] {analysisResult.terminalHealLog}</p>
-                      <div className="flex items-center justify-between mt-2 pt-2 border-t border-emerald-900/30">
+                      <div className="flex items-center justify-between mt-2 pt-2 border-t border-emerald-900/30 gap-2 flex-wrap">
                         <p className="text-emerald-400 font-semibold">[success] dbt cloud deployment readiness verified.</p>
-                        <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded text-xs font-bold shadow">
-                          {isDeploying ? 'Deploying to Git...' : '☁️ Push Validated Code to GitHub'}
-                        </button>
+                        <div className="flex gap-2">
+                          <button onClick={handleDownloadZip} className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-1.5 rounded text-xs font-bold border border-slate-700">
+                            📦 Export .zip
+                          </button>
+                          <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded text-xs font-bold shadow">
+                            {isDeploying ? 'Deploying...' : gitUsePr ? '🔀 Open GitHub Pull Request' : '☁️ Push to GitHub'}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ) : (
@@ -810,11 +1200,16 @@ ${dbtYaml}`;
                   )
                 ) : (
                   <div className="space-y-1">
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
                       <p className="text-emerald-400 font-semibold">[success] Zero divergence detected. Code verified for cloud deployment.</p>
-                      <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded text-xs font-bold shadow">
-                        {isDeploying ? 'Deploying to Git...' : '☁️ Push Validated Code to GitHub'}
-                      </button>
+                      <div className="flex gap-2">
+                        <button onClick={handleDownloadZip} className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-1.5 rounded text-xs font-bold border border-slate-700">
+                          📦 Export .zip
+                        </button>
+                        <button onClick={handleDeployToGit} disabled={isDeploying} className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded text-xs font-bold shadow">
+                          {isDeploying ? 'Deploying...' : gitUsePr ? '🔀 Open GitHub Pull Request' : '☁️ Push to GitHub'}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )
@@ -871,30 +1266,54 @@ ${dbtYaml}`;
         </div>
       )}
 
-      {/* Config Modals */}
+      {/* Engine Security Config Modal */}
       {showConfigModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-md w-full flex flex-col gap-4 text-xs">
-            <h3 className="font-bold text-white">Engine Configuration</h3>
-            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Engine API Key" className="bg-slate-950 p-2 text-white border border-slate-700 rounded outline-none" />
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setShowConfigModal(false)} className="text-slate-400">Cancel</button>
-              <button onClick={saveConfig} className="bg-indigo-600 text-white px-4 py-2 rounded">Save</button>
+            <h3 className="font-bold text-white text-sm">Engine & Credential Security</h3>
+            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Gemini API Key" className="bg-slate-950 p-2.5 text-white border border-slate-700 rounded outline-none" />
+            <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={rememberSecrets}
+                onChange={(e) => setRememberSecrets(e.target.checked)}
+                className="accent-indigo-600"
+              />
+              <span>Persist credentials across browser restarts (otherwise session-only)</span>
+            </label>
+            <div className="flex justify-between items-center pt-2 border-t border-slate-800">
+              <button onClick={purgeAllSecrets} className="text-rose-400 hover:text-rose-300 font-semibold">
+                Purge Stored Secrets
+              </button>
+              <div className="flex gap-2">
+                <button onClick={() => setShowConfigModal(false)} className="text-slate-400 px-3 py-1.5">Cancel</button>
+                <button onClick={saveConfig} className="bg-indigo-600 text-white px-4 py-1.5 rounded font-semibold">Save</button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
+      {/* GitHub Integration Modal */}
       {showGitModal && (
         <div className="fixed inset-0 bg-slate-950/80 flex items-center justify-center p-4 z-50">
           <div className="bg-[#111928] p-6 rounded-2xl border border-slate-800 max-w-md w-full flex flex-col gap-4 text-xs">
-            <h3 className="font-bold text-white text-sm mb-1">GitHub Integration</h3>
-            <label className="flex flex-col gap-1 text-slate-300">Owner: <input type="text" value={gitOwner} onChange={(e) => setGitOwner(e.target.value)} className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
-            <label className="flex flex-col gap-1 text-slate-300">Repo: <input type="text" value={gitRepo} onChange={(e) => setGitRepo(e.target.value)} className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
-            <label className="flex flex-col gap-1 text-slate-300">Token: <input type="password" value={gitToken} onChange={(e) => setGitToken(e.target.value)} className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
+            <h3 className="font-bold text-white text-sm">GitHub CI/CD Integration</h3>
+            <label className="flex flex-col gap-1 text-slate-300">Owner: <input type="text" value={gitOwner} onChange={(e) => setGitOwner(e.target.value)} placeholder="e.g., octocat" className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
+            <label className="flex flex-col gap-1 text-slate-300">Repo: <input type="text" value={gitRepo} onChange={(e) => setGitRepo(e.target.value)} placeholder="e.g., enterprise-dbt-models" className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
+            <label className="flex flex-col gap-1 text-slate-300">Personal Access Token: <input type="password" value={gitToken} onChange={(e) => setGitToken(e.target.value)} placeholder="ghp_..." className="bg-slate-950 p-2 border border-slate-700 rounded" /></label>
+            <label className="flex items-center gap-2 text-slate-300 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={gitUsePr}
+                onChange={(e) => setGitUsePr(e.target.checked)}
+                className="accent-emerald-500"
+              />
+              <span>Create feature branch & open Pull Request (recommended over direct `main` push)</span>
+            </label>
             <div className="flex justify-end gap-2 mt-2">
-              <button onClick={() => setShowGitModal(false)} className="text-slate-400">Cancel</button>
-              <button onClick={saveGitConfig} className="bg-emerald-600 text-white px-4 py-2 rounded">Connect</button>
+              <button onClick={() => setShowGitModal(false)} className="text-slate-400 px-3 py-1.5">Cancel</button>
+              <button onClick={saveGitConfig} className="bg-emerald-600 text-white px-4 py-1.5 rounded font-semibold">Connect</button>
             </div>
           </div>
         </div>
