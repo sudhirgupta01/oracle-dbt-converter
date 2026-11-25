@@ -7,20 +7,20 @@ const ENGINE_MODELS = [
 ];
 
 const DB_TARGETS = [
-  { id: 'snowflake', label: 'Snowflake' },
-  { id: 'bigquery', label: 'Google BigQuery' },
-  { id: 'alloydb', label: 'Google AlloyDB (PostgreSQL)' },
-  { id: 'spanner', label: 'Google Cloud Spanner' },
-  { id: 'cloudsql_pg', label: 'Google Cloud SQL (PostgreSQL)' },
-  { id: 'databricks', label: 'Databricks SQL' },
-  { id: 'fabric', label: 'Microsoft Fabric Warehouse' },
-  { id: 'redshift', label: 'Amazon Redshift' },
-  { id: 'synapse', label: 'Azure Synapse Analytics' },
-  { id: 'sqlserver', label: 'SQL Server / Azure SQL' },
-  { id: 'postgres', label: 'PostgreSQL (Self-Managed)' },
-  { id: 'athena', label: 'Amazon Athena (Trino)' },
-  { id: 'spark', label: 'Apache Spark SQL' },
-  { id: 'duckdb', label: 'DuckDB (Local / CI)' }
+  { id: 'snowflake', label: 'Snowflake', profile: 'oracle_snowflake_wh' },
+  { id: 'bigquery', label: 'Google BigQuery', profile: 'oracle_bigquery_wh' },
+  { id: 'alloydb', label: 'Google AlloyDB (PostgreSQL)', profile: 'oracle_alloydb_pg' },
+  { id: 'spanner', label: 'Google Cloud Spanner', profile: 'oracle_cloud_spanner' },
+  { id: 'cloudsql_pg', label: 'Google Cloud SQL (PostgreSQL)', profile: 'oracle_cloudsql_pg' },
+  { id: 'databricks', label: 'Databricks SQL', profile: 'oracle_databricks_lakehouse' },
+  { id: 'fabric', label: 'Microsoft Fabric Warehouse', profile: 'oracle_ms_fabric' },
+  { id: 'redshift', label: 'Amazon Redshift', profile: 'oracle_aws_redshift' },
+  { id: 'synapse', label: 'Azure Synapse Analytics', profile: 'oracle_azure_synapse' },
+  { id: 'sqlserver', label: 'SQL Server / Azure SQL', profile: 'oracle_sqlserver' },
+  { id: 'postgres', label: 'PostgreSQL (Self-Managed)', profile: 'oracle_postgres' },
+  { id: 'athena', label: 'Amazon Athena (Trino)', profile: 'oracle_aws_athena' },
+  { id: 'spark', label: 'Apache Spark SQL', profile: 'oracle_apache_spark' },
+  { id: 'duckdb', label: 'DuckDB (Local / CI)', profile: 'oracle_duckdb_ci' }
 ];
 
 // Zero-dependency pure-JS ZIP file generator (Store method, UTF-8 safe)
@@ -51,8 +51,8 @@ function buildZipBlob(filesMap) {
     const lv = new DataView(localHeader.buffer);
     lv.setUint32(0, 0x04034b50, true);
     lv.setUint16(4, 20, true);
-    lv.setUint16(6, 0x0800, true); // UTF-8 flag
-    lv.setUint16(8, 0, true); // Store
+    lv.setUint16(6, 0x0800, true);
+    lv.setUint16(8, 0, true);
     lv.setUint32(14, crc, true);
     lv.setUint32(18, dataBytes.length, true);
     lv.setUint32(22, dataBytes.length, true);
@@ -97,7 +97,7 @@ export default function App() {
   const [sourceCode, setSourceCode] = useState('');
   const [uploadedFileName, setUploadedFileName] = useState('');
   const [targetDb, setTargetDb] = useState('snowflake');
-  const [generatedModels, setGeneratedModels] = useState([]); // [{ name, layer, sql, yaml }]
+  const [generatedModels, setGeneratedModels] = useState([]);
   const [selectedModelIdx, setSelectedModelIdx] = useState(0);
   const [parityTestSql, setParityTestSql] = useState('');
   const [architecturalAdvisory, setArchitecturalAdvisory] = useState(null);
@@ -265,26 +265,30 @@ export default function App() {
 
   const detectImperativeConstructs = (sqlText) => {
     const matches = [];
-    if (/\bCURSOR\b|\bFETCH\b|\bLOOP\b/i.test(sqlText)) matches.push('Explicit Cursor / Row-by-Row Loop');
+    if (/\bCURSOR\b|\bFETCH\b|\bLOOP\b|\bBULK\s+COLLECT\b|\bFORALL\b/i.test(sqlText))
+      matches.push('Cursor / BULK COLLECT / Row-by-Row Loop');
     if (/\bUPDATE\b|\bDELETE\b|\bINSERT\b|\bMERGE\b/i.test(sqlText)) matches.push('Imperative DML Mutation');
-    if (/\bCOMMIT\b|\bROLLBACK\b/i.test(sqlText)) matches.push('Explicit Transaction Control (COMMIT/ROLLBACK)');
+    if (/\bCOMMIT\b|\bROLLBACK\b|\bAUTONOMOUS_TRANSACTION\b/i.test(sqlText))
+      matches.push('Explicit / Autonomous Transaction Control');
     if (/\bRAISE_APPLICATION_ERROR\b|\bEXCEPTION\b|\bDBMS_OUTPUT\b/i.test(sqlText))
       matches.push('Procedural Exception / Application Error Handling');
     if (/\bCONNECT\s+BY\b/i.test(sqlText)) matches.push('Hierarchical CONNECT BY Recursion');
+    if (/\bEXECUTE\s+IMMEDIATE\b/i.test(sqlText)) matches.push('Dynamic SQL (EXECUTE IMMEDIATE)');
     return matches;
   };
 
-  // Unified Project Bundle Builder (Used identically by Scaffolder, ZIP Export, and GitHub Push)
-  const buildDbtProjectBundle = (modelsList, paritySql) => {
+  // Unified Project Bundle Builder (Synchronized across Scaffolder, ZIP Export, and GitHub Push)
+  const buildDbtProjectBundle = (modelsList, paritySql, activeTargetId = targetDb) => {
     const files = {};
     const allContent = modelsList.map((m) => `${m.sql}\n${m.yaml}`).join('\n') + `\n${paritySql || ''}`;
     const usesDbtUtils = /\bdbt_utils\./i.test(allContent);
+    const targetObj = DB_TARGETS.find((t) => t.id === activeTargetId) || DB_TARGETS[0];
 
     files['dbt_project.yml'] = `name: 'oracle_modernised_warehouse'
 version: '1.0.0'
 config-version: 2
 
-profile: 'default'
+profile: '${targetObj.profile}'
 
 model-paths: ["models"]
 test-paths: ["tests"]
@@ -350,6 +354,7 @@ models:
         const isLast = i === entries.length - 1;
         const branch = isLast ? '└── ' : '├── ';
         let note = '';
+        if (key === 'dbt_project.yml') note = `  # Configured for target profile`;
         if (key === 'packages.yml') note = '  # Auto-included for dbt_utils macro dependencies';
         if (key.startsWith('assert_parity_')) note = '  # Automated row-count & aggregate parity test';
         lines.push(`${prefix}${branch}${key}${val === null ? note : '/'}`);
@@ -362,7 +367,7 @@ models:
 
   const handleDownloadZip = () => {
     if (generatedModels.length === 0) return showStatus('Generate dbt models first before exporting ZIP.', true);
-    const bundle = buildDbtProjectBundle(generatedModels, parityTestSql);
+    const bundle = buildDbtProjectBundle(generatedModels, parityTestSql, targetDb);
     const blob = buildZipBlob(bundle);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -373,10 +378,10 @@ models:
     showStatus(`📦 Exported runnable dbt project ZIP (${Object.keys(bundle).length} files).`);
   };
 
-  // Tiered Temperature Control Engine
+  // Tiered Temperature Control Engine (60s timeout for large PL/SQL packages)
   const executeModelRequest = async (modelName, promptText, expectJson, cleanKey, temperature = 0.1) => {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000);
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
     const payload = {
       contents: [{ parts: [{ text: promptText }] }],
       generationConfig: {
@@ -519,7 +524,7 @@ ${sourceCode}`;
     }
   };
 
-  // 2. Code Conversion + Package Decomposition (Temp: 0.1)
+  // 2. Code Conversion + Principal Oracle Semantic & 14-Target Dialect Rules (Temp: 0.1)
   const handleTranspile = async () => {
     if (dagStatus !== 'clean') {
       return showStatus('Pipeline Blocked: Please Analyze DAG and resolve architecture risks first.', true);
@@ -533,39 +538,53 @@ ${sourceCode}`;
 
     const targetLabel = DB_TARGETS.find((t) => t.id === targetDb)?.label || targetDb;
 
-    const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modular, production-ready dbt architecture strictly optimized for ${targetLabel}.
-Strictly obey ALL 8 architectural rules:
+    const prompt = `You are a Principal Oracle Database Architect & Multi-Cloud SQL Specialist. Convert this Oracle PL/SQL into a modular, production-ready dbt architecture strictly optimized for ${targetLabel}.
+Strictly obey ALL 10 architectural & semantic rules:
 
 1. MULTI-PROCEDURE PACKAGE DECOMPOSITION:
    - If the Oracle input is a PL/SQL PACKAGE (or contains multiple procedures/CTEs representing distinct pipeline stages), decompose it into multiple modular dbt models across layers ("staging", "intermediate", "marts") linked via {{ ref('<model_name>') }}.
    - If it is a single view or procedure, return 1 model in the appropriate layer ("staging" for raw source views, "marts" for transformed procedures/aggregations).
 
-2. CONFIG MATERIALIZATION & INCREMENTAL COMPLETENESS:
+2. CONFIG MATERIALIZATION & TARGET-SPECIFIC INCREMENTAL STRATEGY:
    - Every SQL model MUST begin with {{ config(...) }} on line 1.
    - Views: {{ config(materialized='view') }}.
    - Standard tables: {{ config(materialized='table') }}.
-   - Oracle MERGE / incremental upserts: MUST use {{ config(materialized='incremental', unique_key='<pk_col>', incremental_strategy='merge') }} AND include a {% if is_incremental() %} watermark filter block.
+   - Oracle MERGE / delta upserts: MUST include unique_key and {% if is_incremental() %} watermark filter block:
+     * Amazon Redshift: {{ config(materialized='incremental', unique_key='<pk>', incremental_strategy='delete+insert') }}
+     * Apache Spark / Athena: {{ config(materialized='incremental', unique_key='<pk>', incremental_strategy='merge', file_format='iceberg') }}
+     * Snowflake / BigQuery / Databricks / Fabric / Postgres / AlloyDB: {{ config(materialized='incremental', unique_key='<pk>', incremental_strategy='merge') }}
 
-3. ROWNUM & RANKING COLUMN PRESERVATION:
-   - Never collapse ROWNUM subqueries into a bare LIMIT clause if outer SELECT * or ranking aliases are projected. Rewrite using a CTE with ROW_NUMBER() OVER (...) AS <alias>.
+3. EMPTY STRING ('') VS NULL SEMANTIC PARITY:
+   - In Oracle, '' IS NULL and 'a' || NULL = 'a'. In ${targetLabel}, '' is non-null and 'a' || NULL = NULL.
+   - Guard string concatenations with COALESCE(col, '') (or CONCAT) and empty-string checks with NULLIF(col, '') IS NULL where Oracle semantics apply.
 
-4. NATIVE SEQUENCE PRESERVATION (NO MD5 HASHES):
+4. ORACLE DATE TIMESTAMP & ARITHMETIC PRESERVATION:
+   - Oracle DATE always stores hours/minutes/seconds. Preserve TIMESTAMP/DATETIME precision when time components or SYSDATE are used, and translate Oracle date arithmetic (col + N days) using target-native date interval/DATEADD functions (never raw integer addition on BigQuery/Athena/Fabric).
+   - For Google BigQuery, use DATE_TRUNC(col, DAY) (column first, unit second). For Snowflake/Postgres/AlloyDB/Redshift/DuckDB, use DATE_TRUNC('day', col).
+
+5. ROWNUM & ORDER-OF-EXECUTION PRESERVATION:
+   - If ROWNUM is in an outer subquery wrapping ORDER BY, rewrite using a CTE with ROW_NUMBER() OVER (ORDER BY ...) AS <alias> so projected rank columns are preserved.
+   - If ROWNUM <= N is in the SAME block as ORDER BY (filtering before sorting), preserve that exact two-stage semantics in a CTE.
+   - For PostgreSQL / Google AlloyDB / Google Cloud SQL: NEVER emit a QUALIFY clause; always wrap window function filters in a CTE.
+
+6. NATIVE SEQUENCE PRESERVATION (NO MD5 HASHES):
    - Never replace explicit Oracle sequences (.NEXTVAL) with dbt_utils.generate_surrogate_key or MD5 hashes.
    - Use native sequence syntax for ${targetLabel}: nextval('seq') for PostgreSQL/AlloyDB/Cloud SQL/DuckDB, seq.NEXTVAL for Snowflake, NEXT VALUE FOR seq for SQL Server/Synapse/Fabric, GET_NEXT_SEQUENCE_VALUE(SEQUENCE seq) for Cloud Spanner.
 
-5. ENTERPRISE ORACLE IDIOMS:
-   - Convert CONNECT BY PRIOR hierarchical queries into WITH RECURSIVE CTEs.
-   - Convert Oracle (+) implicit outer join syntax into explicit ANSI LEFT OUTER JOIN / RIGHT OUTER JOIN.
-   - Convert KEEP (DENSE_RANK FIRST/LAST ORDER BY ...) into native FIRST_VALUE / window functions.
+7. TARGET-SPECIFIC DIALECT RULES FOR ${targetLabel}:
+   - T-SQL (Microsoft Fabric, Azure Synapse, SQL Server): Use SELECT TOP (N) instead of LIMIT N, and STRING_AGG(col, ', ') WITHIN GROUP (ORDER BY ...).
+   - BigQuery: Use SAFE_DIVIDE(a, b) for division; otherwise use a / NULLIF(b, 0) to prevent ORA-01476 division-by-zero errors.
+   - PIVOT / UNPIVOT: If ${targetLabel} is PostgreSQL, AlloyDB, Cloud SQL, Redshift, or Athena, convert Oracle PIVOT into conditional aggregation (SUM(CASE WHEN ... END)).
+   - Convert CONNECT BY PRIOR into WITH RECURSIVE CTEs, Oracle (+) joins into ANSI LEFT/RIGHT OUTER JOIN, and KEEP (DENSE_RANK FIRST/LAST) into FIRST_VALUE/LAST_VALUE window functions.
 
-6. PROCEDURAL VALIDATIONS TO SCHEMA.YML ASSERTIONS:
+8. PROCEDURAL VALIDATIONS TO SCHEMA.YML ASSERTIONS:
    - Encode PL/SQL validation checks (RAISE_APPLICATION_ERROR, negative value checks) as dbt tests in schema.yml (e.g., dbt_utils.expression_is_true, accepted_values, not_null).
 
-7. AUTOMATED PARITY TEST SQL:
+9. AUTOMATED PARITY TEST SQL:
    - Generate a standalone dbt singular test query in "parityTestSql" that returns failing rows if row counts or key numeric totals diverge from expected source invariants.
 
-8. ARCHITECTURAL ADVISORY:
-   - If imperative constructs (CURSOR, LOOP, COMMIT/ROLLBACK, RAISE_APPLICATION_ERROR, CONNECT BY) were refactored, explain the paradigm shift concisely in "advisory".
+10. ARCHITECTURAL ADVISORY:
+   - If imperative constructs (CURSOR, BULK COLLECT/FORALL, COMMIT/ROLLBACK, AUTONOMOUS_TRANSACTION, RAISE_APPLICATION_ERROR, EXECUTE IMMEDIATE, CONNECT BY) were refactored, explain the paradigm shift concisely in "advisory".
 
 Return a JSON object with this exact schema:
 {
@@ -617,8 +636,7 @@ ${sourceCode}`;
       setParityTestSql(cleanParitySql);
       setArchitecturalAdvisory(finalAdvisory);
 
-      // Synchronize Scaffolder directly with the exact deployable bundle
-      const bundle = buildDbtProjectBundle(modelsList, cleanParitySql);
+      const bundle = buildDbtProjectBundle(modelsList, cleanParitySql, targetDb);
       setScaffoldTree(renderAsciiTreeFromBundle(bundle));
 
       showStatus(
@@ -631,7 +649,7 @@ ${sourceCode}`;
     }
   };
 
-  // 4. Dual Run Validation (Temp: 0.0)
+  // 4. Dual Run Validation (Temp: 0.0 - Principal Oracle & Multi-Cloud Dialect Audit)
   const handleAnalyzeArchitecture = async () => {
     if (generatedModels.length === 0 || !apiKey.trim()) return;
 
@@ -646,13 +664,16 @@ ${sourceCode}`;
       .map((m) => `--- MODEL: models/${m.layer}/${m.name}.sql ---\n${m.sql}\n--- YAML ---\n${m.yaml}`)
       .join('\n\n');
 
-    const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
+    const diagnosticPrompt = `You are a Principal Oracle Database Architect & Strict Cloud SQL Validator for ${targetLabel}.
 Audit this Oracle PL/SQL and all transpiled dbt models + YAML definitions. Check specifically for:
 1. Missing {{ config(materialized=...) }} header or incremental models missing unique_key / {% if is_incremental() %}.
 2. Dropped ROWNUM ranking columns (outer SELECT * projected row_num, but dbt collapsed into LIMIT without ROW_NUMBER() OVER()).
 3. Sequence type corruption (Oracle used .NEXTVAL sequence, but dbt substituted MD5 surrogate_key instead of native sequence syntax for ${targetLabel}).
-4. Un-migrated Oracle syntax ((+) outer joins, CONNECT BY without WITH RECURSIVE, NVL, DECODE, SYSDATE, LISTAGG, MINUS).
-5. Missing schema.yml validation tests when Oracle PL/SQL had RAISE_APPLICATION_ERROR business rules.
+4. Silent Oracle semantic bugs:
+   - Unprotected '' vs NULL concatenation/comparison drift.
+   - Raw integer date addition (date_col + 7) or reversed DATE_TRUNC argument order on BigQuery.
+   - Unsupported dialect syntax on ${targetLabel} (e.g., LIMIT instead of TOP on Fabric/Synapse/SQL Server; QUALIFY on Postgres/AlloyDB; native PIVOT on Postgres/AlloyDB; unprotected division by zero).
+5. Un-migrated Oracle syntax ((+) outer joins, CONNECT BY without WITH RECURSIVE, NVL, DECODE, SYSDATE, LISTAGG, MINUS) or missing schema.yml validation tests for RAISE_APPLICATION_ERROR rules.
 
 Note: Converting imperative PL/SQL CURSOR loops, UPDATE statements, or COMMIT/ROLLBACK blocks into set-based declarative SELECT models is VALID dbt architecture and should NOT be flagged as drift.
 
@@ -660,7 +681,7 @@ Return a JSON object with this exact schema:
 {
   "hasDrift": boolean,
   "parityScore": "string percentage (e.g., '100.00%' or '78.50%')",
-  "driftType": "string or null (e.g., 'INCOMPLETE_INCREMENTAL_BLOCK', 'DROPPED_RANK_COLUMN', 'SEQUENCE_HASH_MISMATCH', 'ORACLE_SYNTAX_LEAK', 'MISSING_SCHEMA_ASSERTION')",
+  "driftType": "string or null (e.g., 'DIALECT_SYNTAX_MISMATCH', 'NULL_SEMANTIC_DRIFT', 'INCOMPLETE_INCREMENTAL_BLOCK', 'DROPPED_RANK_COLUMN', 'SEQUENCE_HASH_MISMATCH', 'MISSING_SCHEMA_ASSERTION')",
   "terminalDriftLog": "string or null (detailed explanation of the risk)",
   "healAction": "string or null (short description of the fix)",
   "terminalHealLog": "string or null (explanation of what the self-healing agent will patch)"
@@ -692,7 +713,7 @@ ${serializedModels}`;
     }
   };
 
-  // 5. Self Healing (Temp: 0.15)
+  // 5. Self Healing (Temp: 0.15 - Patches Models AND Re-Syncs Parity Test SQL)
   const triggerSelfHealingRemediation = async () => {
     if (generatedModels.length === 0 || !analysisResult?.hasDrift) return;
     setIsRemediating(true);
@@ -702,14 +723,15 @@ ${serializedModels}`;
       .map((m) => `--- MODEL: ${m.name} (${m.layer}) ---\nSQL:\n${m.sql}\nYAML:\n${m.yaml}`)
       .join('\n\n');
 
-    const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix these dbt models to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
+    const remediationPrompt = `You are a Principal dbt Remediation Agent for ${targetLabel}. Fix these dbt models and parity test SQL to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
 
-Ensure every patched model satisfies all enterprise rules:
+Ensure every patched model satisfies all enterprise & target-dialect rules for ${targetLabel}:
 - Begins with {{ config(...) }} (with unique_key and {% if is_incremental() %} if incremental).
 - Uses ROW_NUMBER() OVER (...) CTE if Oracle projected a ROWNUM alias in outer SELECT *.
 - Preserves native sequences for ${targetLabel} instead of MD5 surrogate keys.
-- Converts (+) joins to ANSI JOINs and CONNECT BY to WITH RECURSIVE.
+- Guards '' vs NULL concatenations, division-by-zero (SAFE_DIVIDE / NULLIF), and target-specific date/TOP/QUALIFY/PIVOT rules.
 - Encodes Oracle RAISE_APPLICATION_ERROR checks as dbt tests in schema.yml.
+- Updates "parityTestSql" so column names match the patched models.
 
 Return a JSON object with this exact schema:
 {
@@ -720,14 +742,18 @@ Return a JSON object with this exact schema:
       "sql": "string (complete patched SQL)",
       "yaml": "string (complete patched YAML)"
     }
-  ]
+  ],
+  "parityTestSql": "string (updated dbt singular parity test SQL matching patched columns)"
 }
 
 Original Oracle Source:
 ${sourceCode}
 
 Current Models:
-${serializedModels}`;
+${serializedModels}
+
+Current Parity Test SQL:
+${parityTestSql}`;
 
     try {
       const rawResponse = await callNeuralEngine(remediationPrompt, true, 0.15);
@@ -744,16 +770,19 @@ ${serializedModels}`;
         };
       });
 
+      const updatedParitySql = parsed.parityTestSql ? formatMultiline(parsed.parityTestSql) : parityTestSql;
+
       if (patchedModels.length > 0) {
         setGeneratedModels(patchedModels);
         setSelectedModelIdx(0);
-        const bundle = buildDbtProjectBundle(patchedModels, parityTestSql);
+        setParityTestSql(updatedParitySql);
+        const bundle = buildDbtProjectBundle(patchedModels, updatedParitySql, targetDb);
         setScaffoldTree(renderAsciiTreeFromBundle(bundle));
       }
 
       setIsSelfHealedCode(true);
       setAiSelfHealing(true);
-      showStatus(`Self-Healing complete: dbt models patched for ${analysisResult.driftType}.`);
+      showStatus(`Self-Healing complete: dbt models and parity test patched for ${analysisResult.driftType}.`);
     } catch (err) {
       showStatus(`Self-Healing Error: ${err.message}`, true);
     } finally {
@@ -761,7 +790,7 @@ ${serializedModels}`;
     }
   };
 
-  // 6. GitHub Deploy (Layered Paths + Full dbt Project + Pull Request Option)
+  // 6. GitHub Deploy (Auto-initializes Empty Repos + Layered Paths + Pull Request Option)
   const encodeBase64 = (str) => {
     const bytes = new TextEncoder().encode(str);
     let binary = '';
@@ -782,7 +811,9 @@ ${serializedModels}`;
     });
     if (!res.ok) {
       const errJson = await res.json().catch(() => ({}));
-      throw new Error(errJson.message || `GitHub API HTTP ${res.status}`);
+      const err = new Error(errJson.message || `GitHub API HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
     }
     return res.json();
   };
@@ -826,10 +857,28 @@ ${serializedModels}`;
       const repoInfo = await githubApi('');
       const defaultBranch = repoInfo.default_branch || 'main';
       let targetBranch = defaultBranch;
+      let baseSha = null;
 
-      if (gitUsePr) {
+      try {
         const refInfo = await githubApi(`/git/ref/heads/${encodeURIComponent(defaultBranch)}`);
-        const baseSha = refInfo.object.sha;
+        baseSha = refInfo.object.sha;
+      } catch (refErr) {
+        // Auto-initialize empty repository with README.md if HTTP 409 / 404
+        if (refErr.status === 409 || refErr.status === 404) {
+          const initRes = await githubApi('/contents/README.md', {
+            method: 'PUT',
+            body: JSON.stringify({
+              message: 'chore: initialize repository for dbt migration',
+              content: encodeBase64('# Oracle Modernisation dbt Repository\nInitialized automatically by Oracle Modernisation Accelerator.\n')
+            })
+          });
+          baseSha = initRes.commit?.sha;
+        } else {
+          throw refErr;
+        }
+      }
+
+      if (gitUsePr && baseSha) {
         const primarySlug = generatedModels[0]?.name || 'oracle_migration';
         targetBranch = `dbt-migration/${primarySlug}-${Date.now().toString().slice(-4)}`;
 
@@ -839,12 +888,12 @@ ${serializedModels}`;
         });
       }
 
-      const bundle = buildDbtProjectBundle(generatedModels, parityTestSql);
+      const bundle = buildDbtProjectBundle(generatedModels, parityTestSql, targetDb);
       for (const [repoPath, content] of Object.entries(bundle)) {
         await pushFileToBranch(repoPath, content, targetBranch);
       }
 
-      if (gitUsePr) {
+      if (gitUsePr && baseSha) {
         const pr = await githubApi('/pulls', {
           method: 'POST',
           body: JSON.stringify({
