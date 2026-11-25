@@ -9,10 +9,18 @@ const ENGINE_MODELS = [
 const DB_TARGETS = [
   { id: 'snowflake', label: 'Snowflake' },
   { id: 'bigquery', label: 'Google BigQuery' },
+  { id: 'alloydb', label: 'Google AlloyDB (PostgreSQL)' },
+  { id: 'spanner', label: 'Google Cloud Spanner' },
+  { id: 'cloudsql_pg', label: 'Google Cloud SQL (PostgreSQL)' },
   { id: 'databricks', label: 'Databricks SQL' },
+  { id: 'fabric', label: 'Microsoft Fabric Warehouse' },
   { id: 'redshift', label: 'Amazon Redshift' },
   { id: 'synapse', label: 'Azure Synapse Analytics' },
-  { id: 'postgres', label: 'PostgreSQL' }
+  { id: 'sqlserver', label: 'SQL Server / Azure SQL' },
+  { id: 'postgres', label: 'PostgreSQL (Self-Managed)' },
+  { id: 'athena', label: 'Amazon Athena (Trino)' },
+  { id: 'spark', label: 'Apache Spark SQL' },
+  { id: 'duckdb', label: 'DuckDB (Local / CI)' }
 ];
 
 export default function App() {
@@ -23,7 +31,8 @@ export default function App() {
   const [targetDb, setTargetDb] = useState('snowflake');
   const [dbtSql, setDbtSql] = useState('');
   const [dbtYaml, setDbtYaml] = useState('');
-  const [dbtModelName, setDbtModelName] = useState('stg_oracle_model'); // Dynamic Filename State
+  const [dbtModelName, setDbtModelName] = useState('stg_oracle_model');
+  const [architecturalAdvisory, setArchitecturalAdvisory] = useState(null);
 
   // UI & Loading States
   const [isLoading, setIsLoading] = useState(false);
@@ -85,6 +94,7 @@ export default function App() {
     setAnalysisResult(null);
     setAiSelfHealing(false);
     setIsSelfHealedCode(false);
+    setArchitecturalAdvisory(null);
   };
 
   const handleResetWorkspace = () => {
@@ -117,6 +127,16 @@ export default function App() {
     }
     const cleanStr = rawStr.substring(start, end + 1);
     return JSON.parse(cleanStr);
+  };
+
+  // Detect imperative PL/SQL constructs to supplement AI advisory
+  const detectImperativeConstructs = (sqlText) => {
+    const matches = [];
+    if (/\bCURSOR\b|\bFETCH\b|\bLOOP\b/i.test(sqlText)) matches.push('Explicit Cursor / Row-by-Row Loop');
+    if (/\bUPDATE\b|\bDELETE\b|\bINSERT\b|\bMERGE\b/i.test(sqlText)) matches.push('Imperative DML Mutation');
+    if (/\bCOMMIT\b|\bROLLBACK\b/i.test(sqlText)) matches.push('Explicit Transaction Control (COMMIT/ROLLBACK)');
+    if (/\bRAISE_APPLICATION_ERROR\b|\bEXCEPTION\b|\bDBMS_OUTPUT\b/i.test(sqlText)) matches.push('Procedural Exception / Application Error Handling');
+    return matches;
   };
 
   // Tiered Temperature Control Engine
@@ -265,7 +285,7 @@ ${sourceCode}`;
     }
   };
 
-  // 2. Code Conversion (Temp: 0.1 - Standard Deterministic)
+  // 2. Code Conversion (Temp: 0.1 - Deterministic with SME & Multi-Cloud Transpilation Rules)
   const handleTranspile = async () => {
     if (dagStatus !== 'clean') {
       return showStatus('Pipeline Blocked: Please Analyze DAG and resolve architecture risks first.', true);
@@ -280,13 +300,41 @@ ${sourceCode}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const prompt = `You are a Principal Data Engineer. Convert this Oracle PL/SQL into a modern dbt architecture strictly optimized for ${targetLabel}.
-Ensure the SQL dialect used matches ${targetLabel} conventions.
+Ensure the SQL dialect used matches ${targetLabel} conventions and strictly obey ALL of these rules:
+
+1. CONFIG MATERIALIZATION HEADER (MANDATORY):
+   - Always begin the dbt SQL output with a {{ config(...) }} block on line 1.
+   - Use {{ config(materialized='view') }} when converting Oracle VIEWs.
+   - Use {{ config(materialized='table') }} (or materialized='incremental' for MERGE upserts) when converting Oracle PROCEDUREs or DML blocks.
+
+2. ROWNUM & RANKING COLUMN PRESERVATION:
+   - Whenever Oracle uses ROWNUM inside a subquery (especially with outer SELECT * or projected row_num aliases), NEVER collapse it into a bare LIMIT clause that drops the ranking column.
+   - Instead, rewrite it using a Common Table Expression (CTE) with ROW_NUMBER() OVER (ORDER BY ...) AS <original_alias> and filter in the outer SELECT * WHERE <original_alias> <= N.
+
+3. NATIVE SEQUENCE PRESERVATION (NO MD5 HASHES):
+   - NEVER replace an explicit Oracle sequence (e.g., emp_seq.NEXTVAL) with {{ dbt_utils.generate_surrogate_key(...) }} or MD5/SHA string hashes, as that breaks numeric data types and sequence statefulness.
+   - Preserve native sequence syntax for ${targetLabel}:
+     * PostgreSQL / Google AlloyDB / Google Cloud SQL / DuckDB: nextval('seq_name')
+     * Snowflake: seq_name.NEXTVAL
+     * SQL Server / Azure Synapse / Microsoft Fabric: NEXT VALUE FOR seq_name
+     * Google Cloud Spanner: GET_NEXT_SEQUENCE_VALUE(SEQUENCE seq_name)
+     * Other engines without sequence objects (BigQuery, Databricks, Athena, Spark, Redshift): ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) or native identity/sequence syntax with an inline SQL comment.
+
+4. PROCEDURAL VALIDATIONS TO SCHEMA.YML ASSERTIONS:
+   - If the Oracle PL/SQL contains validation checks (e.g., IF v_count > 0 THEN RAISE_APPLICATION_ERROR(...) for negative values or invalid states), translate the data selection cleanly in SQL AND encode the business rule as a dbt test inside schema.yml (using dbt_utils.expression_is_true, accepted_values, or not_null).
+
+5. CONSISTENT DBT REFERENCES:
+   - Reference upstream staging models consistently using {{ ref('stg_<table_name>') }} (or {{ source('raw', '<table_name>') }} for raw base tables).
+
+6. ARCHITECTURAL ADVISORY FOR IMPERATIVE PL/SQL:
+   - If the source contains imperative procedural constructs (CURSOR loops, row-by-row UPDATE/DELETE, COMMIT/ROLLBACK, RAISE_APPLICATION_ERROR, EXCEPTION blocks, DBMS_OUTPUT), populate "advisory" with a concise 2-sentence explanation of how imperative state mutations/transactions were refactored into declarative set-based dbt paradigms and schema.yml tests. Otherwise set "advisory" to null.
 
 Return a JSON object with this exact schema:
 {
-  "modelName": "string (snake_case dbt model name derived from Oracle source, e.g., 'stg_customers')",
-  "sql": "string (the dbt SELECT model tailored for ${targetLabel})",
-  "yaml": "string (the dbt schema.yml definition with standard tests like unique and not_null)"
+  "modelName": "string (snake_case dbt model name derived from Oracle source, e.g., 'top_employee_view')",
+  "sql": "string (complete dbt SQL starting with {{ config(...) }})",
+  "yaml": "string (complete dbt schema.yml with column descriptions, standard tests, and translated validation rules)",
+  "advisory": "string or null"
 }
 
 Oracle Source:
@@ -298,11 +346,19 @@ ${sourceCode}`;
 
       const cleanSql = formatMultiline(parsed.sql || '');
       const cleanYaml = formatMultiline(parsed.yaml || '');
-      
+
+      const detectedImperative = detectImperativeConstructs(sourceCode);
+      const finalAdvisory =
+        parsed.advisory ||
+        (detectedImperative.length > 0
+          ? `Declarative Refactoring Notice: Legacy imperative constructs (${detectedImperative.join(', ')}) have been converted into set-based dbt SQL transformations and schema.yml assertions, as dbt executes atomic batch builds rather than row-by-row transactions or runtime exceptions.`
+          : null);
+
       setDbtModelName(parsed.modelName || 'stg_oracle_model');
       setDbtSql(cleanSql);
       setDbtYaml(cleanYaml);
-      
+      setArchitecturalAdvisory(finalAdvisory);
+
       showStatus(`Translation complete for ${targetLabel}. Go to Dual Run Validation to verify and deploy.`);
       generateDynamicScaffold(sourceCode, cleanSql, cleanYaml);
     } catch (err) {
@@ -318,7 +374,7 @@ ${sourceCode}`;
     const driftContext = driftInfo?.hasDrift ? `\nNote: Validator flagged ${driftInfo.driftType}. Include the fix in the tree.` : '';
 
     const scaffoldPrompt = `You are a Data Architect. Inspect this Oracle PL/SQL and the generated dbt SQL/YAML. 
-Design a tailored dbt repository folder tree (e.g., dbt_project.yml, models/staging, models/marts).${driftContext}
+Design a tailored dbt repository folder tree (e.g., dbt_project.yml, models/staging, models/marts, tests/).${driftContext}
 Return ONLY a clean ASCII directory tree (using ├──, └──, │) with brief inline comments. Do NOT include markdown backticks or JSON.
 
 PL/SQL: ${srcCode}
@@ -335,7 +391,7 @@ dbt SQL: ${targetSql}`;
     }
   };
 
-  // 4. Dual Run Validation (Temp: 0.0 - Strict Scoring)
+  // 4. Dual Run Validation (Temp: 0.0 - Strict Audit Including SME & Multi-Cloud Edge Cases)
   const handleAnalyzeArchitecture = async () => {
     if (!dbtSql.trim() || !apiKey.trim()) return;
 
@@ -348,13 +404,20 @@ dbt SQL: ${targetSql}`;
     const targetLabel = DB_TARGETS.find(t => t.id === targetDb)?.label || targetDb;
 
     const diagnosticPrompt = `You are a strict Cloud Data Architecture Validator for ${targetLabel}.
-Analyze this Oracle PL/SQL and its transpiled dbt equivalent. Look for un-migrated Oracle functions, dialect errors for ${targetLabel}, or missing dbt tests.
+Audit this Oracle PL/SQL and its transpiled dbt SQL + YAML equivalent. Check specifically for:
+1. Missing {{ config(materialized=...) }} header at the top of the dbt SQL.
+2. Dropped ROWNUM ranking columns (e.g., Oracle outer SELECT * projected a row_num column, but dbt collapsed it into LIMIT without ROW_NUMBER() OVER()).
+3. Sequence type corruption (Oracle used .NEXTVAL sequence, but dbt replaced it with dbt_utils.generate_surrogate_key / MD5 string hash instead of native sequence syntax for ${targetLabel}).
+4. Missing schema.yml validation tests when Oracle PL/SQL had RAISE_APPLICATION_ERROR business rules.
+5. Un-migrated Oracle functions (NVL, DECODE, SYSDATE, TRUNC, LISTAGG, MINUS) or dialect errors for ${targetLabel}.
+
+Note: Converting imperative PL/SQL CURSOR loops, UPDATE statements, or COMMIT/ROLLBACK blocks into set-based declarative SELECT models is VALID dbt architecture and should NOT be flagged as drift if the business logic and config header are accurate.
 
 Return a JSON object with this exact schema:
 {
   "hasDrift": boolean,
   "parityScore": "string percentage (e.g., '100.00%' or '72.14%')",
-  "driftType": "string or null (e.g., 'ORACLE_FUNCTION_LEAK', 'DIALECT_MISMATCH')",
+  "driftType": "string or null (e.g., 'DROPPED_RANK_COLUMN', 'SEQUENCE_HASH_MISMATCH', 'MISSING_CONFIG_HEADER', 'MISSING_SCHEMA_ASSERTION', 'ORACLE_FUNCTION_LEAK')",
   "terminalDriftLog": "string or null (detailed explanation of the risk)",
   "healAction": "string or null (short description of the fix)",
   "terminalHealLog": "string or null (explanation of what the self-healing agent will patch)"
@@ -363,7 +426,9 @@ Return a JSON object with this exact schema:
 Oracle Source:
 ${sourceCode}
 dbt SQL:
-${dbtSql}`;
+${dbtSql}
+dbt YAML:
+${dbtYaml}`;
 
     try {
       const rawResponse = await callNeuralEngine(diagnosticPrompt, true, 0.0);
@@ -386,7 +451,7 @@ ${dbtSql}`;
     }
   };
 
-  // 5. Self Healing (Temp: 0.15 - Slight Flexibility for Refactoring)
+  // 5. Self Healing (Temp: 0.15 - Guided Refactoring)
   const triggerSelfHealingRemediation = async () => {
     if (!dbtSql.trim() || !analysisResult?.hasDrift) return;
     setIsRemediating(true);
@@ -395,12 +460,20 @@ ${dbtSql}`;
 
     const remediationPrompt = `You are a dbt remediation agent for ${targetLabel}. Fix this dbt SQL and YAML to resolve: ${analysisResult.driftType} (${analysisResult.healAction}).
 
+Ensure the patched code strictly satisfies all rules:
+- Begins with {{ config(materialized='view') }} or {{ config(materialized='table') }}.
+- Uses a ROW_NUMBER() OVER (...) CTE if Oracle projected a ROWNUM alias in an outer SELECT *.
+- Preserves native sequences for ${targetLabel} (nextval('...') for PostgreSQL/AlloyDB/Cloud SQL/DuckDB, .NEXTVAL for Snowflake, NEXT VALUE FOR for SQL Server/Synapse/Fabric, GET_NEXT_SEQUENCE_VALUE(SEQUENCE ...) for Cloud Spanner) instead of MD5 surrogate keys.
+- Encodes Oracle RAISE_APPLICATION_ERROR checks as dbt tests in schema.yml.
+
 Return a JSON object with this exact schema:
 {
   "sql": "string (the complete refactored ${targetLabel} dbt SQL)",
   "yaml": "string (the complete updated dbt schema.yml)"
 }
 
+Original Oracle Source:
+${sourceCode}
 Current SQL:
 ${dbtSql}
 Current YAML:
@@ -475,7 +548,6 @@ ${dbtYaml}`;
     setIsDeploying(true);
     showStatus('Initiating commit to GitHub repository...');
 
-    // Extract a clean, safe filename from the dynamic model name state
     const safeName = (dbtModelName || 'stg_oracle_model').replace(/[^a-z0-9_]/gi, '').toLowerCase();
 
     try {
@@ -558,6 +630,21 @@ ${dbtYaml}`;
             </button>
           </div>
 
+          {architecturalAdvisory && (
+            <div className="bg-amber-950/40 border border-amber-700/50 rounded-xl px-4 py-3 text-xs text-amber-200 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <span className="text-amber-400 text-sm leading-none mt-0.5">💡</span>
+                <div>
+                  <span className="font-bold text-amber-300 uppercase tracking-wider text-[10px] block mb-0.5">
+                    Architectural Advisory — Declarative dbt Paradigm Shift
+                  </span>
+                  <p className="text-amber-100/90 leading-relaxed">{architecturalAdvisory}</p>
+                </div>
+              </div>
+              <button onClick={() => setArchitecturalAdvisory(null)} className="text-amber-400 hover:text-amber-200 text-xs">✕</button>
+            </div>
+          )}
+
           <div className="grid grid-cols-2 gap-4 flex-1">
             <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800">
               <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
@@ -577,6 +664,11 @@ ${dbtYaml}`;
                         <option key={db.id} value={db.id}>{db.label}</option>
                       ))}
                     </select>
+                    {hasGeneratedCode && (
+                      <span className="text-[10px] font-mono text-slate-400 bg-slate-900/90 px-2 py-0.5 rounded border border-slate-800">
+                        {dbtModelName}.sql
+                      </span>
+                    )}
                   </div>
                   {isSelfHealedCode && <span className="bg-emerald-500/15 text-emerald-300 text-[10px] px-2.5 py-0.5 rounded border border-emerald-500/30">⚡ Self-Healed</span>}
                 </div>
@@ -586,6 +678,11 @@ ${dbtYaml}`;
               <div className="flex flex-col bg-[#111928] rounded-xl border border-slate-800 flex-1">
                 <div className="bg-[#0c1220] p-3 border-b border-slate-800 flex justify-between items-center">
                   <span className="text-xs font-semibold text-emerald-400">TARGET: dbt Schema (.yml)</span>
+                  {hasGeneratedCode && (
+                    <span className="text-[10px] font-mono text-slate-400 bg-slate-900/90 px-2 py-0.5 rounded border border-slate-800">
+                      schema_{dbtModelName}.yml
+                    </span>
+                  )}
                 </div>
                 <textarea readOnly value={dbtYaml} className="w-full flex-1 p-4 bg-transparent font-mono text-xs text-emerald-100 outline-none" placeholder="dbt schema and tests will generate here..." spellCheck={false} />
               </div>
@@ -656,7 +753,7 @@ ${dbtYaml}`;
 
             {hasGeneratedCode && validationRun && analysisResult ? (
               <div className="grid grid-cols-4 px-6 py-4 items-center text-xs text-slate-300 gap-2">
-                <div className="font-mono text-cyan-300">Generated dbt Model</div>
+                <div className="font-mono text-cyan-300">{dbtModelName}.sql</div>
                 <div>
                   <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${!isDriftDetected || aiSelfHealing ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20'}`}>
                     {!isDriftDetected || aiSelfHealing ? 'Parity Verified' : analysisResult.driftType}
